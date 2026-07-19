@@ -1,9 +1,9 @@
 """Application configuration loaded from environment variables."""
 
 from functools import lru_cache
-from typing import Annotated
+from typing import Annotated, Self
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     telegram_webhook_url: str = ""
     telegram_webhook_path: str = "/telegram/webhook"
     telegram_webhook_secret: str = ""
+    bot_username: str | None = None
     allowed_chat_id: int | None = None
     admin_user_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
 
@@ -85,6 +86,26 @@ class Settings(BaseSettings):
         if value is None or value == "":
             return None
         return int(value)  # type: ignore[arg-type]
+
+    @model_validator(mode="after")
+    def normalize_webhook_url(self) -> Self:
+        if not self.telegram_webhook_url:
+            return self
+
+        url = self.telegram_webhook_url.strip()
+        if not url.startswith(("http://", "https://")):
+            url = f"https://{url}"
+
+        path = self.telegram_webhook_path or "/telegram/webhook"
+        if not path.startswith("/"):
+            path = f"/{path}"
+
+        base = url.rstrip("/")
+        if not base.endswith(path):
+            base = f"{base}{path}"
+
+        object.__setattr__(self, "telegram_webhook_url", base)
+        return self
 
     @property
     def is_production(self) -> bool:

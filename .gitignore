@@ -34,4 +34,6 @@ Thumbs.db
 
 # Local data
 *.log
+app-logs-*.txt
+deploy-logs-*.txt
 .coverage.*

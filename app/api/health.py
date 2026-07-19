@@ -7,6 +7,7 @@ from typing import Any
 from fastapi import APIRouter, Response, status
 
 from app.config import Settings, clear_settings_cache, get_settings
+from app.db.session import check_database_connection
 
 router = APIRouter(tags=["health"])
 
@@ -25,16 +26,11 @@ async def health() -> dict[str, str]:
 
 @router.get("/ready")
 async def ready(response: Response) -> dict[str, Any]:
-    """
-    Readiness probe.
-
-    Stage 1: validates configuration loadability.
-    Stage 2+: will also probe PostgreSQL (no paid AI calls).
-    """
+    """Readiness probe: config + PostgreSQL (no paid AI calls)."""
     try:
         clear_settings_cache()
         settings = get_settings()
-        checks = _readiness_checks(settings)
+        checks = await _readiness_checks(settings)
     except Exception as exc:  # noqa: BLE001
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return {
@@ -51,15 +47,15 @@ async def ready(response: Response) -> dict[str, Any]:
     return {"status": "ready", "checks": checks}
 
 
-def _readiness_checks(settings: Settings) -> dict[str, bool]:
-    checks: dict[str, bool] = {
-        "config_loaded": True,
-    }
+async def _readiness_checks(settings: Settings) -> dict[str, bool]:
+    checks: dict[str, bool] = {"config_loaded": True}
     if settings.is_production:
         checks["critical_env"] = not bool(settings.missing_critical_settings())
     else:
-        # Development may run with empty secrets until later stages.
         checks["critical_env"] = True
-    # Placeholder until PostgreSQL is wired in stage 2.
-    checks["database"] = True
+
+    if settings.database_url:
+        checks["database"] = await check_database_connection()
+    else:
+        checks["database"] = not settings.is_production
     return checks

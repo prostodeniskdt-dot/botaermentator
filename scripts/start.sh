@@ -3,7 +3,11 @@ set -eu
 
 PORT="${PORT:-${APP_PORT:-8080}}"
 
+if [ -n "${DATABASE_URL:-}" ]; then
+  echo "start.sh: running alembic upgrade head"
+  alembic upgrade head
+fi
+
 echo "start.sh: launching uvicorn on [::]:${PORT} (module app.main:app)"
 
-# Bind on :: so Timeweb probes to localhost (often IPv6 ::1) reach the app.
 exec python -m uvicorn app.main:app --host "::" --port "${PORT}"

@@ -67,3 +67,21 @@ def test_production_accepts_complete_settings(monkeypatch: pytest.MonkeyPatch) -
     assert settings.is_production is True
     assert settings.allowed_chat_id == -100123
     assert settings.missing_critical_settings() == []
+
+
+def test_webhook_url_normalized(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_URL", "example.com")
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_PATH", "/telegram/webhook")
+    clear_settings_cache()
+    settings = Settings()
+    assert settings.telegram_webhook_url == "https://example.com/telegram/webhook"
+
+
+def test_webhook_url_adds_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_URL", "https://example.com")
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_PATH", "/telegram/webhook")
+    clear_settings_cache()
+    settings = Settings()
+    assert settings.telegram_webhook_url == "https://example.com/telegram/webhook"
