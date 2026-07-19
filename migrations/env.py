@@ -8,7 +8,7 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.engine import Connection
-from sqlalchemy.ext.asyncio import async_engine_from_config
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.config import get_settings
 from app.db.base import Base
@@ -35,6 +35,13 @@ def get_url() -> str:
     return get_settings().database_url
 
 
+def get_connect_args() -> dict:
+    url = get_url()
+    if "ssl=" in url or "sslmode=" in url:
+        return {"ssl": True}
+    return {}
+
+
 def run_migrations_offline() -> None:
     url = get_url()
     context.configure(
@@ -56,12 +63,10 @@ def do_run_migrations(connection: Connection) -> None:
 
 
 async def run_async_migrations() -> None:
-    configuration = config.get_section(config.config_ini_section) or {}
-    configuration["sqlalchemy.url"] = get_url()
-    connectable = async_engine_from_config(
-        configuration,
-        prefix="sqlalchemy.",
+    connectable = create_async_engine(
+        get_url(),
         poolclass=pool.NullPool,
+        connect_args=get_connect_args(),
     )
 
     async with connectable.connect() as connection:

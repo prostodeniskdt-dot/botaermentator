@@ -107,6 +107,18 @@ class Settings(BaseSettings):
         object.__setattr__(self, "telegram_webhook_url", base)
         return self
 
+    @model_validator(mode="after")
+    def normalize_database_url(self) -> Self:
+        if not self.database_url:
+            return self
+        url = self.database_url
+        if url.startswith("postgres://"):
+            url = url.replace("postgres://", "postgresql+asyncpg://", 1)
+        elif url.startswith("postgresql://") and "+asyncpg" not in url:
+            url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        object.__setattr__(self, "database_url", url)
+        return self
+
     @property
     def is_production(self) -> bool:
         return self.app_env.lower() in {"production", "prod"}

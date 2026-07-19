@@ -85,3 +85,15 @@ def test_webhook_url_adds_path(monkeypatch: pytest.MonkeyPatch) -> None:
     clear_settings_cache()
     settings = Settings()
     assert settings.telegram_webhook_url == "https://example.com/telegram/webhook"
+
+
+def test_database_url_normalized_to_asyncpg(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql://user:pass@host:5432/db?sslmode=require",
+    )
+    clear_settings_cache()
+    settings = Settings()
+    assert settings.database_url.startswith("postgresql+asyncpg://")
+
