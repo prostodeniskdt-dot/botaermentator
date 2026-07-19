@@ -36,8 +36,7 @@ def get_url() -> str:
 
 
 def get_connect_args() -> dict:
-    url = get_url()
-    if "ssl=" in url or "sslmode=" in url:
+    if get_settings().database_ssl_required:
         return {"ssl": True}
     return {}
 

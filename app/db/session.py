@@ -18,7 +18,7 @@ def get_engine(settings: Settings | None = None):
     if _engine is None:
         settings = settings or get_settings()
         connect_args: dict = {}
-        if "ssl=" in settings.database_url or "sslmode=" in settings.database_url:
+        if settings.database_ssl_required:
             connect_args["ssl"] = True
         _engine = create_async_engine(
             settings.database_url,

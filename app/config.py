@@ -1,10 +1,16 @@
 """Application configuration loaded from environment variables."""
 
+import hashlib
+import re
 from functools import lru_cache
 from typing import Annotated, Self
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+
+_WEBHOOK_SECRET_ALLOWED = re.compile(r"[^A-Za-z0-9_-]")
+_LIBPQ_SSL_QUERY_KEYS = frozenset({"ssl", "sslmode", "sslcert", "sslkey", "sslrootcert"})
 
 
 class Settings(BaseSettings):
@@ -30,6 +36,7 @@ class Settings(BaseSettings):
     admin_user_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
 
     database_url: str = ""
+    database_ssl_required: bool = False
 
     timeweb_api_base_url: str = "https://api.timeweb.cloud"
     timeweb_agent_1_id: str = ""
@@ -108,15 +115,43 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def normalize_webhook_secret(self) -> Self:
+        secret = self.telegram_webhook_secret.strip()
+        if not secret:
+            return self
+
+        cleaned = _WEBHOOK_SECRET_ALLOWED.sub("", secret)
+        if not cleaned:
+            seed = self.telegram_bot_token or secret
+            cleaned = hashlib.sha256(seed.encode()).hexdigest()[:32]
+
+        object.__setattr__(self, "telegram_webhook_secret", cleaned)
+        return self
+
+    @model_validator(mode="after")
     def normalize_database_url(self) -> Self:
         if not self.database_url:
             return self
+
         url = self.database_url
         if url.startswith("postgres://"):
             url = url.replace("postgres://", "postgresql+asyncpg://", 1)
         elif url.startswith("postgresql://") and "+asyncpg" not in url:
             url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+        parsed = urlparse(url)
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        ssl_required = _database_url_requires_ssl(query)
+        filtered_query = [
+            (key, value)
+            for key, values in query.items()
+            if key.lower() not in _LIBPQ_SSL_QUERY_KEYS
+            for value in values
+        ]
+        url = urlunparse(parsed._replace(query=urlencode(filtered_query)))
+
         object.__setattr__(self, "database_url", url)
+        object.__setattr__(self, "database_ssl_required", ssl_required)
         return self
 
     @property
@@ -149,6 +184,20 @@ class Settings(BaseSettings):
             if value is None or value == "":
                 missing.append(name)
         return missing
+
+
+def _database_url_requires_ssl(query: dict[str, list[str]]) -> bool:
+    for key, values in query.items():
+        key_lower = key.lower()
+        if key_lower == "sslmode" and any(
+            value.lower() in {"require", "verify-ca", "verify-full"} for value in values
+        ):
+            return True
+        if key_lower == "ssl" and any(
+            value.lower() in {"require", "true", "1"} for value in values
+        ):
+            return True
+    return False
 
 
 @lru_cache

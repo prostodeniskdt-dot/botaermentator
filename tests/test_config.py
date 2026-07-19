@@ -96,4 +96,26 @@ def test_database_url_normalized_to_asyncpg(monkeypatch: pytest.MonkeyPatch) -> 
     clear_settings_cache()
     settings = Settings()
     assert settings.database_url.startswith("postgresql+asyncpg://")
+    assert "sslmode=" not in settings.database_url
+    assert settings.database_ssl_required is True
+
+
+def test_webhook_secret_sanitized(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "my+secret/token!")
+    clear_settings_cache()
+    settings = Settings()
+    assert settings.telegram_webhook_secret == "mysecrettoken"
+
+
+def test_webhook_secret_derived_when_only_invalid_chars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "123:ABC")
+    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "!!!")
+    clear_settings_cache()
+    settings = Settings()
+    assert len(settings.telegram_webhook_secret) == 32
+    assert all(ch in "0123456789abcdef" for ch in settings.telegram_webhook_secret)
 

@@ -80,7 +80,10 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
             application.state.dispatcher = dispatcher
 
             if settings.telegram_webhook_url:
-                await _register_webhook(bot, settings, logger)
+                try:
+                    await _register_webhook(bot, settings, logger)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("telegram_webhook_registration_failed", error=str(exc))
         except Exception as exc:  # noqa: BLE001
             logger.warning("bot_initialization_failed", error=str(exc))
     else:
