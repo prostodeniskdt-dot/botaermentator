@@ -9,6 +9,12 @@ from app.config import clear_settings_cache
 from app.main import create_app
 
 
+def test_root_returns_ok(client: TestClient) -> None:
+    response = client.get("/")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
 def test_health_returns_ok(client: TestClient) -> None:
     response = client.get("/health")
     assert response.status_code == 200

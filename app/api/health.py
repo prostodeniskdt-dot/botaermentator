@@ -11,6 +11,12 @@ from app.config import Settings, clear_settings_cache, get_settings
 router = APIRouter(tags=["health"])
 
 
+@router.get("/")
+async def root() -> dict[str, str]:
+    """Root path for platforms that probe / instead of /health."""
+    return {"status": "ok"}
+
+
 @router.get("/health")
 async def health() -> dict[str, str]:
     """Liveness probe: process is up. Does not touch DB or AI."""

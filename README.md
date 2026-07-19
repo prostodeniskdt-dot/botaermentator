@@ -49,7 +49,8 @@ docker run --rm -p 8080:8080 -e APP_ENV=development botpodergun
 
 - Deploy type: **Dockerfile**
 - Project directory: empty or `/`
-- Health check path: `/health` (not `/ready`)
+- Health check path: `/health` or `/` (not `/ready`)
+- Dockerfile must include `HEALTHCHECK` — Timeweb waits for Docker status `healthy`
 - Port: **8080**
 - Start command: leave **empty** (Dockerfile CMD), or set exactly:  
   `python -m uvicorn app.main:app --host 0.0.0.0 --port 8080`  
