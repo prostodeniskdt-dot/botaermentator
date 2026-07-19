@@ -119,3 +119,18 @@ def test_webhook_secret_derived_when_only_invalid_chars(
     assert len(settings.telegram_webhook_secret) == 32
     assert all(ch in "0123456789abcdef" for ch in settings.telegram_webhook_secret)
 
+
+def test_database_password_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql+asyncpg://gen_user:wrong@host:5432/default_db",
+    )
+    monkeypatch.setenv("DATABASE_PASSWORD", "p@ss:word/with")
+    clear_settings_cache()
+    settings = Settings()
+    assert settings.database_url == (
+        "postgresql+asyncpg://gen_user:p%40ss%3Aword%2Fwith@host:5432/default_db"
+    )
+
+

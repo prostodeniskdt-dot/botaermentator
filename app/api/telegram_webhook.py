@@ -34,8 +34,14 @@ def create_webhook_router(settings: Settings | None = None) -> APIRouter:
             )
 
         payload = await request.json()
+        update_id = payload.get("update_id")
+        logger.info("telegram_webhook_received", update_id=update_id)
+
         update = Update.model_validate(payload, context={"bot": bot})
-        await dispatcher.feed_update(bot, update)
+        try:
+            await dispatcher.feed_update(bot, update)
+        except Exception:
+            logger.exception("telegram_webhook_handler_error", update_id=update_id)
         return {"ok": True}
 
     return router

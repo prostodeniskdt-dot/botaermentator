@@ -4,6 +4,11 @@
 
 Create a managed PostgreSQL instance in Timeweb Cloud and copy the connection string into `DATABASE_URL`.
 
+If authentication fails with `InvalidPasswordError`, the password likely contains special characters that break the URL. Either:
+
+- URL-encode the password (e.g. `@` → `%40`), or
+- set `DATABASE_PASSWORD` to the raw password from the Timeweb panel (keep user/host/db in `DATABASE_URL`).
+
 ## 2. AI agents
 
 Create three Cloud AI agents:

@@ -10,6 +10,6 @@ if [ -n "${DATABASE_URL:-}" ]; then
   fi
 fi
 
-echo "start.sh: launching uvicorn on [::]:${PORT} (module app.main:app)"
+echo "start.sh: launching uvicorn on 0.0.0.0:${PORT} (module app.main:app)"
 
-exec python -m uvicorn app.main:app --host "::" --port "${PORT}"
+exec python -m uvicorn app.main:app --host "0.0.0.0" --port "${PORT}"

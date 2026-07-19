@@ -18,7 +18,7 @@ from app.api.health import router as health_router
 from app.api.telegram_webhook import create_webhook_router
 from app.bot.factory import build_services, create_bot, create_dispatcher
 from app.config import clear_settings_cache, get_settings
-from app.db.session import get_engine, reset_engine
+from app.db.session import check_database_connection, get_engine, reset_engine
 from app.logging import configure_logging, get_logger
 
 
@@ -93,6 +93,16 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
 
     if settings.database_url:
         get_engine(settings)
+        if await check_database_connection():
+            logger.info("database_connected")
+        else:
+            logger.error(
+                "database_connection_failed",
+                hint=(
+                    "Check DATABASE_URL credentials. If the password contains "
+                    "@/:?#&=+ or spaces, set DATABASE_PASSWORD separately."
+                ),
+            )
 
     try:
         yield
@@ -113,6 +123,14 @@ async def _register_webhook(bot, settings, logger) -> None:
         drop_pending_updates=False,
     )
     logger.info("telegram_webhook_registered", url=settings.telegram_webhook_url)
+
+    info = await bot.get_webhook_info()
+    logger.info(
+        "telegram_webhook_info",
+        url=info.url,
+        pending_updates=info.pending_update_count,
+        last_error_message=info.last_error_message,
+    )
 
 
 def create_app() -> FastAPI:

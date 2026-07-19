@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     admin_user_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
 
     database_url: str = ""
+    database_password: str = ""
     database_ssl_required: bool = False
 
     timeweb_api_base_url: str = "https://api.timeweb.cloud"
@@ -152,6 +153,22 @@ class Settings(BaseSettings):
 
         object.__setattr__(self, "database_url", url)
         object.__setattr__(self, "database_ssl_required", ssl_required)
+        return self
+
+    @model_validator(mode="after")
+    def apply_database_password_override(self) -> Self:
+        if not self.database_url or not self.database_password:
+            return self
+
+        from sqlalchemy.engine.url import make_url
+
+        url = make_url(self.database_url)
+        url = url.set(password=self.database_password)
+        object.__setattr__(
+            self,
+            "database_url",
+            url.render_as_string(hide_password=False),
+        )
         return self
 
     @property
