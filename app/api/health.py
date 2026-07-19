@@ -6,7 +6,7 @@ from typing import Any
 
 from fastapi import APIRouter, Response, status
 
-from app.config import Settings, get_settings
+from app.config import Settings, clear_settings_cache, get_settings
 
 router = APIRouter(tags=["health"])
 
@@ -25,10 +25,19 @@ async def ready(response: Response) -> dict[str, Any]:
     Stage 1: validates configuration loadability.
     Stage 2+: will also probe PostgreSQL (no paid AI calls).
     """
-    settings = get_settings()
-    checks = _readiness_checks(settings)
-    all_ok = all(checks.values())
+    try:
+        clear_settings_cache()
+        settings = get_settings()
+        checks = _readiness_checks(settings)
+    except Exception as exc:  # noqa: BLE001
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+        return {
+            "status": "not_ready",
+            "checks": {"config_loaded": False, "critical_env": False, "database": False},
+            "error": str(exc),
+        }
 
+    all_ok = all(checks.values())
     if not all_ok:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         return {"status": "not_ready", "checks": checks}

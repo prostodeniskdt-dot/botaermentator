@@ -48,11 +48,12 @@ docker run --rm -p 8080:8080 -e APP_ENV=development botpodergun
 ## Timeweb App Platform
 
 - Deploy type: **Dockerfile**
-- Health check path: `/health`
-- Start command (if the panel overrides Docker CMD):  
-  `uvicorn app.main:app --host 0.0.0.0 --port 8080`  
-  **Not** `botpodergun.main:app` — Python-пакет приложения называется `app`.
-- Leave the start command empty to use the Dockerfile `CMD`/`ENTRYPOINT`.
+- Project directory: empty or `/`
+- Health check path: `/health` (not `/ready`)
+- Port: **8080**
+- Start command: leave **empty** (Dockerfile CMD), or set exactly:  
+  `python -m uvicorn app.main:app --host 0.0.0.0 --port 8080`  
+  Do **not** use `main:app` or `botpodergun.main:app`.
 
 ## Secrets
 
