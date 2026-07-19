@@ -5,6 +5,7 @@ from __future__ import annotations
 from aiogram import Router
 from aiogram.types import Message
 
+from app.db.repositories import Repository
 from app.db.session import session_scope
 from app.logging import get_logger
 
@@ -25,8 +26,9 @@ async def on_group_message(
         return
 
     async with session_scope() as db:
+        repo = Repository(db)
         await question_service.handle_group_message(
-            db,
+            repo,
             bot,
             message,
             update_id=update_id,

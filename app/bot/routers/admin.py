@@ -8,6 +8,7 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
+from app.db.repositories import Repository
 from app.db.session import session_scope
 from app.services.usage_service import UsageService
 
@@ -35,7 +36,8 @@ async def admin_cost_today(message: Message, settings, usage_service: UsageServi
     if not _is_admin(message, settings):
         return
     async with session_scope() as db:
-        cost = await usage_service.get_today_cost(db)
+        repo = Repository(db)
+        cost = await usage_service.get_today_cost(repo)
     await message.answer(f"Estimated spend today: {cost:.2f} RUB")
 
 
@@ -50,8 +52,9 @@ async def admin_block_user(message: Message, settings, blocking_service) -> None
     user_id = int(parts[1])
     reason = parts[2]
     async with session_scope() as db:
+        repo = Repository(db)
         await blocking_service.block_user(
-            db,
+            repo,
             user_id,
             reason=reason,
             admin_telegram_user_id=message.from_user.id,  # type: ignore[union-attr]
@@ -69,8 +72,9 @@ async def admin_unblock_user(message: Message, settings, blocking_service) -> No
         return
     user_id = int(parts[1])
     async with session_scope() as db:
+        repo = Repository(db)
         await blocking_service.unblock_user(
-            db,
+            repo,
             user_id,
             admin_telegram_user_id=message.from_user.id,  # type: ignore[union-attr]
         )
@@ -88,8 +92,9 @@ async def admin_block_session(message: Message, settings, blocking_service) -> N
     session_id = uuid.UUID(parts[1])
     reason = parts[2]
     async with session_scope() as db:
+        repo = Repository(db)
         await blocking_service.block_session(
-            db,
+            repo,
             session_id,
             reason=reason,
             admin_telegram_user_id=message.from_user.id,  # type: ignore[union-attr]
@@ -107,8 +112,9 @@ async def admin_unblock_session(message: Message, settings, blocking_service) ->
         return
     session_id = uuid.UUID(parts[1])
     async with session_scope() as db:
+        repo = Repository(db)
         await blocking_service.unblock_session(
-            db,
+            repo,
             session_id,
             admin_telegram_user_id=message.from_user.id,  # type: ignore[union-attr]
         )
