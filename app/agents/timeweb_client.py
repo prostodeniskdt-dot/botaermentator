@@ -144,12 +144,13 @@ class TimewebClient:
             variants.append(("native", url, {"message": message}))
 
         # gpt-5.x + tools rejects default reasoning_effort on chat/completions.
+        # Do not send model name: Timeweb uses the agent panel model; a wrong id
+        # breaks /v1/responses with "model was not found".
         variants.append(
             (
                 "chat_completions_no_reasoning",
                 self._openai_compat_url(agent_id, "chat/completions"),
                 {
-                    "model": "gpt-5.6-sol",
                     "messages": [{"role": "user", "content": message}],
                     "stream": False,
                     "reasoning_effort": "none",
@@ -161,10 +162,16 @@ class TimewebClient:
                 "responses",
                 self._openai_compat_url(agent_id, "responses"),
                 {
-                    "model": "gpt-5.6-sol",
                     "input": message,
                     "reasoning": {"effort": "none"},
                 },
+            )
+        )
+        variants.append(
+            (
+                "responses_plain",
+                self._openai_compat_url(agent_id, "responses"),
+                {"input": message},
             )
         )
         return variants

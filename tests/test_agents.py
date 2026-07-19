@@ -246,7 +246,7 @@ async def test_timeweb_client_4xx_tries_fallback_then_raises(
     assert native.call_count == 1
     assert native_alt.call_count == 1
     assert openai_compat.call_count == 1
-    assert responses.call_count == 1
+    assert responses.call_count == 2
     await client.aclose()
 
 
