@@ -92,6 +92,19 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     application.state.timeweb_client = timeweb_client
 
     if settings.database_url:
+        from sqlalchemy.engine.url import make_url
+
+        db_url = make_url(settings.database_url)
+        logger.info(
+            "database_config",
+            host=db_url.host,
+            port=db_url.port,
+            user=db_url.username,
+            database=db_url.database,
+            password_configured=bool(db_url.password),
+            ssl_required=settings.database_ssl_required,
+            password_override_configured=bool(settings.database_password),
+        )
         get_engine(settings)
         if await check_database_connection():
             logger.info("database_connected")

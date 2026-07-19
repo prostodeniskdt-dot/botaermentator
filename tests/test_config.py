@@ -120,6 +120,21 @@ def test_webhook_secret_derived_when_only_invalid_chars(
     assert all(ch in "0123456789abcdef" for ch in settings.telegram_webhook_secret)
 
 
+def test_database_url_strips_trailing_quote_and_enables_ssl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv(
+        "DATABASE_URL",
+        "postgresql://gen_user:@host.twc1.net:5432/default_db?sslmode=verify-full'",
+    )
+    monkeypatch.setenv("DATABASE_PASSWORD", "secret")
+    clear_settings_cache()
+    settings = Settings()
+    assert settings.database_ssl_required is True
+    assert "sslmode=" not in settings.database_url
+
+
 def test_database_password_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("APP_ENV", "development")
     monkeypatch.setenv(

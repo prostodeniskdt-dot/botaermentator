@@ -134,15 +134,17 @@ class Settings(BaseSettings):
         if not self.database_url:
             return self
 
-        url = self.database_url
+        url = _strip_surrounding_quotes(self.database_url)
         if url.startswith("postgres://"):
             url = url.replace("postgres://", "postgresql+asyncpg://", 1)
         elif url.startswith("postgresql://") and "+asyncpg" not in url:
             url = url.replace("postgresql://", "postgresql+asyncpg://", 1)
 
         parsed = urlparse(url)
-        query = parse_qs(parsed.query, keep_blank_values=True)
+        query = _clean_ssl_query_values(parse_qs(parsed.query, keep_blank_values=True))
         ssl_required = _database_url_requires_ssl(query)
+        if parsed.hostname and parsed.hostname.endswith(".twc1.net"):
+            ssl_required = True
         filtered_query = [
             (key, value)
             for key, values in query.items()
@@ -153,6 +155,16 @@ class Settings(BaseSettings):
 
         object.__setattr__(self, "database_url", url)
         object.__setattr__(self, "database_ssl_required", ssl_required)
+        return self
+
+    @model_validator(mode="after")
+    def normalize_database_password(self) -> Self:
+        if self.database_password:
+            object.__setattr__(
+                self,
+                "database_password",
+                _strip_surrounding_quotes(self.database_password),
+            )
         return self
 
     @model_validator(mode="after")
@@ -201,6 +213,20 @@ class Settings(BaseSettings):
             if value is None or value == "":
                 missing.append(name)
         return missing
+
+
+def _strip_surrounding_quotes(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1].strip()
+    return value
+
+
+def _clean_ssl_query_values(query: dict[str, list[str]]) -> dict[str, list[str]]:
+    return {
+        key: [_strip_surrounding_quotes(value) for value in values]
+        for key, values in query.items()
+    }
 
 
 def _database_url_requires_ssl(query: dict[str, list[str]]) -> bool:
