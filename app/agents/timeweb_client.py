@@ -52,7 +52,7 @@ class TimewebCallResult:
 
 
 class TimewebClient:
-    """Calls Timeweb Cloud AI agents via native API with OpenAI-compatible fallback."""
+    """Calls Timeweb Cloud AI agents via native API with OpenAI-compatible fallbacks."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -75,98 +75,99 @@ class TimewebClient:
         message: str,
     ) -> TimewebCallResult:
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        native_urls = self._native_urls(agent_id)
         attempts = max(1, self.settings.timeweb_max_attempts)
         last_error: Exception | None = None
 
+        retryable_failure = False
         for attempt in range(1, attempts + 1):
-            for url in native_urls:
+            retryable_failure = False
+            for mode, url, payload in self._request_variants(agent_id, message):
                 started = time.perf_counter()
                 try:
-                    return await self._post_once(
-                        url,
-                        headers,
-                        {"message": message},
-                        started,
-                    )
+                    result = await self._post_once(url, headers, payload, started)
+                    if mode != "native":
+                        logger.info(
+                            "timeweb_fallback_ok",
+                            agent_id=agent_id,
+                            mode=mode,
+                        )
+                    return result
                 except TimewebTimeoutError as exc:
                     last_error = exc
+                    retryable_failure = True
                     logger.warning(
                         "timeweb_timeout",
                         agent_id=agent_id,
                         attempt=attempt,
+                        mode=mode,
                         url=url,
                     )
                 except TimewebHTTPError as exc:
                     last_error = exc
                     logger.warning(
-                        "timeweb_native_http_error",
+                        "timeweb_http_error",
                         agent_id=agent_id,
                         attempt=attempt,
+                        mode=mode,
                         status=exc.status_code,
                         url=url,
                     )
-                    if exc.status_code != 400:
-                        if exc.status_code and 400 <= exc.status_code < 500:
-                            break
-                        continue
+                    # Try next transport for provider_error / 400; hard-stop on auth errors.
+                    if exc.status_code in {401, 403}:
+                        raise
+                    if exc.status_code and exc.status_code >= 500:
+                        retryable_failure = True
                 except httpx.HTTPError as exc:
                     last_error = TimewebClientError(str(exc), error_code="transport_error")
+                    retryable_failure = True
                     logger.warning(
                         "timeweb_transport_error",
                         agent_id=agent_id,
                         attempt=attempt,
+                        mode=mode,
                         url=url,
                     )
 
-            # Some Timeweb agents accept only OpenAI-compatible chat completions.
-            started = time.perf_counter()
-            try:
-                result = await self._post_once(
-                    self._openai_compat_url(agent_id),
-                    headers,
-                    {
-                        "model": "gpt-4.1",
-                        "messages": [{"role": "user", "content": message}],
-                        "stream": False,
-                    },
-                    started,
-                )
-                logger.info("timeweb_openai_compat_fallback_ok", agent_id=agent_id)
-                return result
-            except TimewebTimeoutError as exc:
-                last_error = exc
-                logger.warning(
-                    "timeweb_timeout",
-                    agent_id=agent_id,
-                    attempt=attempt,
-                    mode="openai_compat",
-                )
-            except TimewebHTTPError as exc:
-                last_error = exc
-                if exc.status_code and 400 <= exc.status_code < 500:
-                    raise
-                logger.warning(
-                    "timeweb_http_error",
-                    agent_id=agent_id,
-                    attempt=attempt,
-                    status=exc.status_code,
-                    mode="openai_compat",
-                )
-            except httpx.HTTPError as exc:
-                last_error = TimewebClientError(str(exc), error_code="transport_error")
-                logger.warning(
-                    "timeweb_transport_error",
-                    agent_id=agent_id,
-                    attempt=attempt,
-                    mode="openai_compat",
-                )
-
-            if attempt < attempts:
+            if attempt < attempts and retryable_failure:
                 await self._backoff(attempt)
+                continue
+            break
 
         assert last_error is not None
         raise last_error
+
+    def _request_variants(
+        self, agent_id: str, message: str
+    ) -> list[tuple[str, str, dict[str, Any]]]:
+        variants: list[tuple[str, str, dict[str, Any]]] = []
+        for url in self._native_urls(agent_id):
+            variants.append(("native", url, {"message": message}))
+
+        # gpt-5.x + tools rejects default reasoning_effort on chat/completions.
+        variants.append(
+            (
+                "chat_completions_no_reasoning",
+                self._openai_compat_url(agent_id, "chat/completions"),
+                {
+                    "model": "gpt-5.6-sol",
+                    "messages": [{"role": "user", "content": message}],
+                    "stream": False,
+                    "reasoning_effort": "none",
+                },
+            )
+        )
+        variants.append(
+            (
+                "responses",
+                self._openai_compat_url(agent_id, "responses"),
+                {
+                    "model": "gpt-5.6-sol",
+                    "input": message,
+                    "reasoning": {"effort": "none"},
+                },
+            )
+        )
+        return variants
 
     def _native_urls(self, agent_id: str) -> list[str]:
         base = self.settings.timeweb_api_base_url.rstrip("/")
@@ -177,10 +178,8 @@ class TimewebClient:
         return urls
 
     @staticmethod
-    def _openai_compat_url(agent_id: str) -> str:
-        return (
-            f"{_OPENAI_COMPAT_HOST}/api/v1/cloud-ai/agents/{agent_id}/v1/chat/completions"
-        )
+    def _openai_compat_url(agent_id: str, suffix: str) -> str:
+        return f"{_OPENAI_COMPAT_HOST}/api/v1/cloud-ai/agents/{agent_id}/v1/{suffix}"
 
     @retry(
         reraise=True,
@@ -220,11 +219,17 @@ class TimewebClient:
 
         data = response.json()
         message_text = _extract_message(data)
+        if not message_text.strip():
+            raise TimewebHTTPError(
+                "Empty agent response body",
+                status_code=response.status_code,
+                error_code="empty_response",
+            )
         usage = data.get("usage") or {}
         return TimewebCallResult(
             message=message_text,
             response_id=str(data.get("id") or data.get("response_id") or "") or None,
-            finish_reason=data.get("finish_reason"),
+            finish_reason=data.get("finish_reason") or data.get("status"),
             http_status=response.status_code,
             latency_ms=latency_ms,
             raw=data,
@@ -241,10 +246,11 @@ class TimewebClient:
 
 
 def _extract_message(data: dict[str, Any]) -> str:
-    for key in ("message", "content", "text", "answer"):
+    for key in ("message", "content", "text", "answer", "output_text"):
         value = data.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
+
     choices = data.get("choices")
     if isinstance(choices, list) and choices:
         first = choices[0]
@@ -256,4 +262,28 @@ def _extract_message(data: dict[str, Any]) -> str:
                     return content.strip()
             if isinstance(msg, str):
                 return msg.strip()
+
+    output = data.get("output")
+    if isinstance(output, list):
+        parts: list[str] = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "message":
+                content = item.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        text = block.get("text") or block.get("output_text")
+                        if isinstance(text, str) and text.strip():
+                            parts.append(text.strip())
+                elif isinstance(content, str) and content.strip():
+                    parts.append(content.strip())
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+        if parts:
+            return "\n".join(parts)
+
     return ""

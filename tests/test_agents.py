@@ -160,6 +160,9 @@ async def test_agent2_timeout_fallback(settings: Settings, timeweb_base: str, mo
     respx.post(
         "https://agent.timeweb.cloud/api/v1/cloud-ai/agents/agent2/v1/chat/completions"
     ).mock(side_effect=httpx.TimeoutException("timeout"))
+    respx.post(
+        "https://agent.timeweb.cloud/api/v1/cloud-ai/agents/agent2/v1/responses"
+    ).mock(side_effect=httpx.TimeoutException("timeout"))
     client = TimewebClient(settings)
     agent = ContextRelationAgent(settings, client)
     result = await agent.evaluate(
@@ -205,6 +208,9 @@ async def test_agent3_http_500(settings: Settings, timeweb_base: str, mock_repo:
     respx.post(
         "https://agent.timeweb.cloud/api/v1/cloud-ai/agents/agent3/v1/chat/completions"
     ).mock(return_value=httpx.Response(500, json={"error": "fail"}))
+    respx.post(
+        "https://agent.timeweb.cloud/api/v1/cloud-ai/agents/agent3/v1/responses"
+    ).mock(return_value=httpx.Response(500, json={"error": "fail"}))
     client = TimewebClient(settings)
     agent = MainExpertAgent(settings, client)
     result = await agent.answer(
@@ -231,12 +237,16 @@ async def test_timeweb_client_4xx_tries_fallback_then_raises(
     openai_compat = respx.post(
         "https://agent.timeweb.cloud/api/v1/cloud-ai/agents/agent1/v1/chat/completions"
     ).mock(return_value=httpx.Response(400, json={"error": "bad"}))
+    responses = respx.post(
+        "https://agent.timeweb.cloud/api/v1/cloud-ai/agents/agent1/v1/responses"
+    ).mock(return_value=httpx.Response(400, json={"error": "bad"}))
     client = TimewebClient(settings)
     with pytest.raises(TimewebHTTPError):
         await client.call_agent(agent_id="agent1", token="t1", message="hi")
     assert native.call_count == 1
     assert native_alt.call_count == 1
     assert openai_compat.call_count == 1
+    assert responses.call_count == 1
     await client.aclose()
 
 
@@ -265,4 +275,33 @@ async def test_timeweb_client_openai_compat_fallback(
     client = TimewebClient(settings)
     result = await client.call_agent(agent_id="agent3", token="t3", message="Вопрос")
     assert result.message == "Ответ эксперта"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_timeweb_client_responses_fallback(settings: Settings, timeweb_base: str):
+    respx.post(f"{timeweb_base}/api/v1/cloud-ai/agents/agent3/call").mock(
+        return_value=httpx.Response(400, json={"error": "bad"})
+    )
+    respx.post("https://agent.timeweb.cloud/api/v1/cloud-ai/agents/agent3/call").mock(
+        return_value=httpx.Response(400, json={"error": "bad"})
+    )
+    respx.post(
+        "https://agent.timeweb.cloud/api/v1/cloud-ai/agents/agent3/v1/chat/completions"
+    ).mock(return_value=httpx.Response(400, json={"error": "bad"}))
+    respx.post(
+        "https://agent.timeweb.cloud/api/v1/cloud-ai/agents/agent3/v1/responses"
+    ).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "resp-1",
+                "output_text": "Ответ через responses API",
+            },
+        )
+    )
+    client = TimewebClient(settings)
+    result = await client.call_agent(agent_id="agent3", token="t3", message="Вопрос")
+    assert result.message == "Ответ через responses API"
     await client.aclose()
