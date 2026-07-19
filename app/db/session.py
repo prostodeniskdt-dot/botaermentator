@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.config import Settings, get_settings
 from app.db.ssl import build_asyncpg_ssl_connect_args
+from app.logging import get_logger
 
 _engine = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
@@ -64,7 +65,8 @@ async def check_database_connection() -> bool:
         async with factory() as session:
             await session.execute(text("SELECT 1"))
         return True
-    except Exception:
+    except Exception as exc:
+        get_logger(__name__).error("database_connection_error", error_type=type(exc).__name__)
         return False
 
 

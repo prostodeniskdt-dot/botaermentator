@@ -169,6 +169,21 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def normalize_timeweb_agent_credentials(self) -> Self:
+        for field in (
+            "timeweb_agent_1_id",
+            "timeweb_agent_1_token",
+            "timeweb_agent_2_id",
+            "timeweb_agent_2_token",
+            "timeweb_agent_3_id",
+            "timeweb_agent_3_token",
+        ):
+            value = getattr(self, field)
+            if isinstance(value, str) and value:
+                object.__setattr__(self, field, _strip_surrounding_quotes(value))
+        return self
+
+    @model_validator(mode="after")
     def apply_database_password_override(self) -> Self:
         if not self.database_url or not self.database_password:
             return self

@@ -90,6 +90,15 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         logger.warning("telegram_bot_token_missing")
 
     application.state.timeweb_client = timeweb_client
+    logger.info(
+        "timeweb_agents_configured",
+        agent_1_id=settings.timeweb_agent_1_id,
+        agent_2_id=settings.timeweb_agent_2_id,
+        agent_3_id=settings.timeweb_agent_3_id,
+        agent_1_token_configured=bool(settings.timeweb_agent_1_token),
+        agent_2_token_configured=bool(settings.timeweb_agent_2_token),
+        agent_3_token_configured=bool(settings.timeweb_agent_3_token),
+    )
 
     if settings.database_url:
         from sqlalchemy.engine.url import make_url
@@ -102,8 +111,10 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
             user=db_url.username,
             database=db_url.database,
             password_configured=bool(db_url.password),
+            password_length=len(db_url.password or ""),
             ssl_required=settings.database_ssl_required,
             password_override_configured=bool(settings.database_password),
+            password_override_length=len(settings.database_password or ""),
         )
         get_engine(settings)
         if await check_database_connection():

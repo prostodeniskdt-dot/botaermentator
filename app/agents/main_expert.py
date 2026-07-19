@@ -86,7 +86,12 @@ class MainExpertAgent:
                 success=False,
                 error_code=getattr(exc, "error_code", "client_error"),
             )
-            logger.error("agent3_failed", error=str(exc))
+            logger.error(
+                "agent3_failed",
+                error=str(exc),
+                agent_id=self.settings.timeweb_agent_3_id,
+                status_code=getattr(exc, "status_code", None),
+            )
             return None
 
     async def _record_usage(

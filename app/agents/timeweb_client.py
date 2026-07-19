@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
@@ -13,6 +14,8 @@ from app.config import Settings
 from app.logging import get_logger
 
 logger = get_logger(__name__)
+
+_OPENAI_COMPAT_HOST = "https://agent.timeweb.cloud"
 
 
 class TimewebClientError(Exception):
@@ -49,7 +52,7 @@ class TimewebCallResult:
 
 
 class TimewebClient:
-    """Calls Timeweb Cloud AI agents via native API."""
+    """Calls Timeweb Cloud AI agents via native API with OpenAI-compatible fallback."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -71,24 +74,74 @@ class TimewebClient:
         token: str,
         message: str,
     ) -> TimewebCallResult:
-        url = (
-            f"{self.settings.timeweb_api_base_url.rstrip('/')}"
-            f"/api/v1/cloud-ai/agents/{agent_id}/call"
-        )
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        payload = {"message": message}
-
+        native_urls = self._native_urls(agent_id)
         attempts = max(1, self.settings.timeweb_max_attempts)
         last_error: Exception | None = None
 
         for attempt in range(1, attempts + 1):
+            for url in native_urls:
+                started = time.perf_counter()
+                try:
+                    return await self._post_once(
+                        url,
+                        headers,
+                        {"message": message},
+                        started,
+                    )
+                except TimewebTimeoutError as exc:
+                    last_error = exc
+                    logger.warning(
+                        "timeweb_timeout",
+                        agent_id=agent_id,
+                        attempt=attempt,
+                        url=url,
+                    )
+                except TimewebHTTPError as exc:
+                    last_error = exc
+                    logger.warning(
+                        "timeweb_native_http_error",
+                        agent_id=agent_id,
+                        attempt=attempt,
+                        status=exc.status_code,
+                        url=url,
+                    )
+                    if exc.status_code != 400:
+                        if exc.status_code and 400 <= exc.status_code < 500:
+                            break
+                        continue
+                except httpx.HTTPError as exc:
+                    last_error = TimewebClientError(str(exc), error_code="transport_error")
+                    logger.warning(
+                        "timeweb_transport_error",
+                        agent_id=agent_id,
+                        attempt=attempt,
+                        url=url,
+                    )
+
+            # Some Timeweb agents accept only OpenAI-compatible chat completions.
             started = time.perf_counter()
             try:
-                result = await self._post_once(url, headers, payload, started)
+                result = await self._post_once(
+                    self._openai_compat_url(agent_id),
+                    headers,
+                    {
+                        "model": "gpt-4.1",
+                        "messages": [{"role": "user", "content": message}],
+                        "stream": False,
+                    },
+                    started,
+                )
+                logger.info("timeweb_openai_compat_fallback_ok", agent_id=agent_id)
                 return result
             except TimewebTimeoutError as exc:
                 last_error = exc
-                logger.warning("timeweb_timeout", agent_id=agent_id, attempt=attempt)
+                logger.warning(
+                    "timeweb_timeout",
+                    agent_id=agent_id,
+                    attempt=attempt,
+                    mode="openai_compat",
+                )
             except TimewebHTTPError as exc:
                 last_error = exc
                 if exc.status_code and 400 <= exc.status_code < 500:
@@ -98,16 +151,36 @@ class TimewebClient:
                     agent_id=agent_id,
                     attempt=attempt,
                     status=exc.status_code,
+                    mode="openai_compat",
                 )
             except httpx.HTTPError as exc:
                 last_error = TimewebClientError(str(exc), error_code="transport_error")
-                logger.warning("timeweb_transport_error", agent_id=agent_id, attempt=attempt)
+                logger.warning(
+                    "timeweb_transport_error",
+                    agent_id=agent_id,
+                    attempt=attempt,
+                    mode="openai_compat",
+                )
 
             if attempt < attempts:
                 await self._backoff(attempt)
 
         assert last_error is not None
         raise last_error
+
+    def _native_urls(self, agent_id: str) -> list[str]:
+        base = self.settings.timeweb_api_base_url.rstrip("/")
+        urls = [f"{base}/api/v1/cloud-ai/agents/{agent_id}/call"]
+        parsed = urlparse(base)
+        if parsed.netloc != "agent.timeweb.cloud":
+            urls.append(f"{_OPENAI_COMPAT_HOST}/api/v1/cloud-ai/agents/{agent_id}/call")
+        return urls
+
+    @staticmethod
+    def _openai_compat_url(agent_id: str) -> str:
+        return (
+            f"{_OPENAI_COMPAT_HOST}/api/v1/cloud-ai/agents/{agent_id}/v1/chat/completions"
+        )
 
     @retry(
         reraise=True,
@@ -119,7 +192,7 @@ class TimewebClient:
         self,
         url: str,
         headers: dict[str, str],
-        payload: dict[str, str],
+        payload: dict[str, Any],
         started: float,
     ) -> TimewebCallResult:
         try:
@@ -132,8 +205,15 @@ class TimewebClient:
         latency_ms = int((time.perf_counter() - started) * 1000)
 
         if response.status_code >= 400:
+            body_preview = (response.text or "")[:500]
+            logger.error(
+                "timeweb_http_error_body",
+                status=response.status_code,
+                body=body_preview,
+                url=url,
+            )
             raise TimewebHTTPError(
-                f"HTTP {response.status_code}",
+                f"HTTP {response.status_code}: {body_preview}",
                 status_code=response.status_code,
                 error_code="http_error",
             )
