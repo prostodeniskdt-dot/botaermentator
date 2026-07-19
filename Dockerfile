@@ -3,10 +3,14 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
+ENV PORT=8080
 
 WORKDIR /app
 
-RUN addgroup --system app && adduser --system --ingroup app app
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && addgroup --system app && adduser --system --ingroup app app
 
 COPY pyproject.toml README.md ./
 COPY app ./app
@@ -14,16 +18,16 @@ COPY app ./app
 RUN pip install --no-cache-dir . \
     && python -c "import app.main; print('import_ok', app.main.app.title)"
 
-RUN chown -R app:app /app
+COPY scripts/start.sh /start.sh
+RUN chmod +x /start.sh && chown -R app:app /app /start.sh
+
 USER app
 
 EXPOSE 8080
 
-# Timeweb App Platform waits for Docker HEALTHCHECK status "healthy".
-# Without this directive the container stays "starting" until deploy timeout.
-HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=5 \
-  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')" || exit 1
+# Timeweb waits for Docker HEALTHCHECK status "healthy" during deploy.
+# Use curl + explicit IPv4 loopback; bind app on :: so localhost (IPv6) also works.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=40s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:8080/health >/dev/null || exit 1
 
-# Use python -m uvicorn so PATH/scripts quirks cannot block startup.
-# Module path is app.main:app (not main:app / botpodergun.main:app).
-CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["/start.sh"]
