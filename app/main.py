@@ -109,13 +109,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         if await check_database_connection():
             logger.info("database_connected")
         else:
-            logger.error(
-                "database_connection_failed",
-                hint=(
-                    "Check DATABASE_URL credentials. If the password contains "
-                    "@/:?#&=+ or spaces, set DATABASE_PASSWORD separately."
-                ),
-            )
+            logger.error("database_connection_failed")
 
     try:
         yield

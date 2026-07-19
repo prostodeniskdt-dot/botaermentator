@@ -22,6 +22,7 @@ from app.db.models import (  # noqa: F401
     TelegramUser,
     UserQuestion,
 )
+from app.db.ssl import build_asyncpg_ssl_connect_args
 
 config = context.config
 
@@ -36,9 +37,15 @@ def get_url() -> str:
 
 
 def get_connect_args() -> dict:
-    if get_settings().database_ssl_required:
-        return {"ssl": True}
-    return {}
+    settings = get_settings()
+    from sqlalchemy.engine.url import make_url
+
+    hostname = make_url(settings.database_url).host
+    return build_asyncpg_ssl_connect_args(
+        ssl_required=settings.database_ssl_required,
+        hostname=hostname,
+        root_cert_path=settings.database_ssl_root_cert or None,
+    )
 
 
 def run_migrations_offline() -> None:

@@ -8,21 +8,30 @@ from contextlib import asynccontextmanager
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import Settings, get_settings
+from app.db.ssl import build_asyncpg_ssl_connect_args
 
 _engine = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
+
+
+def _ssl_connect_args(settings: Settings) -> dict:
+    from sqlalchemy.engine.url import make_url
+
+    hostname = make_url(settings.database_url).host
+    return build_asyncpg_ssl_connect_args(
+        ssl_required=settings.database_ssl_required,
+        hostname=hostname,
+        root_cert_path=settings.database_ssl_root_cert or None,
+    )
 
 
 def get_engine(settings: Settings | None = None):
     global _engine, _session_factory
     if _engine is None:
         settings = settings or get_settings()
-        connect_args: dict = {}
-        if settings.database_ssl_required:
-            connect_args["ssl"] = True
         _engine = create_async_engine(
             settings.database_url,
-            connect_args=connect_args,
+            connect_args=_ssl_connect_args(settings),
             pool_pre_ping=True,
         )
         _session_factory = async_sessionmaker(_engine, expire_on_commit=False)

@@ -37,6 +37,7 @@ class Settings(BaseSettings):
 
     database_url: str = ""
     database_password: str = ""
+    database_ssl_root_cert: str = ""
     database_ssl_required: bool = False
 
     timeweb_api_base_url: str = "https://api.timeweb.cloud"
