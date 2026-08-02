@@ -77,6 +77,8 @@ class Settings(BaseSettings):
     answer_cache_enabled: bool = True
     answer_cache_min_question_len: int = 10
 
+    rich_messages_enabled: bool = True
+
     @field_validator("admin_user_ids", mode="before")
     @classmethod
     def parse_admin_user_ids(cls, value: object) -> list[int]:

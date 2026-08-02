@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from aiogram import Bot
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import Message
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
+from aiogram.types import InputRichMessage, Message, ReplyParameters
 
 from app.agents.context_relation import ContextRelationAgent
 from app.agents.industry_filter import IndustryFilterAgent
 from app.agents.main_expert import MainExpertAgent
 from app.bot.formatting.telegram_html import format_response_html, split_html_message
+from app.bot.formatting.telegram_rich import prep_rich_markdown, split_rich_message
 from app.bot.mention import AddressKind
 from app.config import Settings
 from app.db.models.entities import AnswerCache
@@ -390,6 +391,26 @@ class QuestionService:
         await self._reply_text(bot, message, AGENT_ERROR)
 
     async def _send_answer_parts(self, bot: Bot, message: Message, text: str):
+        if self.settings.rich_messages_enabled:
+            try:
+                return await self._send_rich_answer_parts(bot, message, text)
+            except TelegramAPIError as exc:
+                logger.warning(
+                    "telegram_rich_fallback",
+                    chat_id=message.chat.id,
+                    error=str(exc),
+                )
+        return await self._send_html_answer_parts(bot, message, text)
+
+    async def _send_rich_answer_parts(self, bot: Bot, message: Message, text: str):
+        markdown = prep_rich_markdown(text)
+        parts = split_rich_message(markdown)
+        sent_message = await self._send_rich_message(bot, message, parts[0], reply=True)
+        for part in parts[1:]:
+            await self._send_rich_message(bot, message, part, reply=False)
+        return sent_message
+
+    async def _send_html_answer_parts(self, bot: Bot, message: Message, text: str):
         html_text = format_response_html(text)
         parts = split_html_message(html_text)
         sent_message = await self._send_message(
@@ -408,6 +429,36 @@ class QuestionService:
                 reply=False,
             )
         return sent_message
+
+    @staticmethod
+    async def _send_rich_message(
+        bot: Bot,
+        message: Message,
+        markdown: str,
+        *,
+        reply: bool = False,
+    ):
+        kwargs: dict = {
+            "chat_id": message.chat.id,
+            "rich_message": InputRichMessage(markdown=markdown),
+            "message_thread_id": message.message_thread_id,
+        }
+        if reply:
+            kwargs["reply_parameters"] = ReplyParameters(message_id=message.message_id)
+            try:
+                return await bot.send_rich_message(**kwargs)
+            except TelegramBadRequest as exc:
+                description = str(exc).lower()
+                if "message to be replied not found" not in description:
+                    raise
+                logger.warning(
+                    "telegram_reply_fallback",
+                    chat_id=message.chat.id,
+                    message_id=message.message_id,
+                    error=str(exc),
+                )
+                kwargs.pop("reply_parameters", None)
+        return await bot.send_rich_message(**kwargs)
 
     @staticmethod
     async def _reply_text(bot: Bot, message: Message, text: str) -> None:
