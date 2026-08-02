@@ -112,9 +112,12 @@ class TimewebClient:
                         status=exc.status_code,
                         url=url,
                     )
-                    # Try next transport for provider_error / 400; hard-stop on auth errors.
-                    if exc.status_code in {401, 403}:
+                    # Hard-stop on auth / quota — other transports will fail the same way.
+                    if exc.status_code in {401, 402, 403}:
                         raise
+                    if exc.error_code == "token_limit_exceeded":
+                        raise
+                    # Try next transport for provider_error / 400; retry later on 5xx.
                     if exc.status_code and exc.status_code >= 500:
                         retryable_failure = True
                 except httpx.HTTPError as exc:
@@ -218,10 +221,14 @@ class TimewebClient:
                 body=body_preview,
                 url=url,
             )
+            error_code = "http_error"
+            lowered = body_preview.lower()
+            if "token_limit_exceeded" in lowered:
+                error_code = "token_limit_exceeded"
             raise TimewebHTTPError(
                 f"HTTP {response.status_code}: {body_preview}",
                 status_code=response.status_code,
-                error_code="http_error",
+                error_code=error_code,
             )
 
         data = response.json()

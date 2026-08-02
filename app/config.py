@@ -74,6 +74,9 @@ class Settings(BaseSettings):
     store_user_questions: bool = True
     store_bot_responses: bool = True
 
+    answer_cache_enabled: bool = True
+    answer_cache_min_question_len: int = 10
+
     @field_validator("admin_user_ids", mode="before")
     @classmethod
     def parse_admin_user_ids(cls, value: object) -> list[int]:

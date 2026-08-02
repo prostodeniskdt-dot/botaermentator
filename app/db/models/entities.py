@@ -157,3 +157,24 @@ class BlockEvent(Base):
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     admin_telegram_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AnswerCache(Base):
+    """Cross-user FAQ cache of successful expert answers."""
+
+    __tablename__ = "answer_cache"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    question_key: Mapped[str] = mapped_column(Text, unique=True, index=True)
+    question_text: Mapped[str] = mapped_column(Text)
+    answer_text: Mapped[str] = mapped_column(Text)
+    category: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_question_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("user_questions.id"), nullable=True
+    )
+    hit_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_hit_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )

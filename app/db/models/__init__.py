@@ -2,6 +2,7 @@
 
 from app.db.models.entities import (
     AIUsageEvent,
+    AnswerCache,
     BlockEvent,
     BotResponse,
     ChatSession,
@@ -13,6 +14,7 @@ from app.db.models.entities import (
 
 __all__ = [
     "AIUsageEvent",
+    "AnswerCache",
     "BlockEvent",
     "BotResponse",
     "ChatSession",

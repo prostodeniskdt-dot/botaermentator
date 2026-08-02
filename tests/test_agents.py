@@ -225,6 +225,38 @@ async def test_agent3_http_500(settings: Settings, timeweb_base: str, mock_repo:
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_timeweb_client_402_stops_without_fallback(
+    settings: Settings, timeweb_base: str
+):
+    native = respx.post(f"{timeweb_base}/api/v1/cloud-ai/agents/agent3/call").mock(
+        return_value=httpx.Response(
+            402,
+            json={
+                "status_code": 402,
+                "error_code": "token_limit_exceeded",
+                "message": "Token limit exceeded",
+            },
+        )
+    )
+    alt = respx.post("https://agent.timeweb.cloud/api/v1/cloud-ai/agents/agent3/call").mock(
+        return_value=httpx.Response(402, json={"error_code": "token_limit_exceeded"})
+    )
+    chat = respx.post(
+        "https://agent.timeweb.cloud/api/v1/cloud-ai/agents/agent3/v1/chat/completions"
+    ).mock(return_value=httpx.Response(402, json={"error": "Token limit exceeded"}))
+    client = TimewebClient(settings)
+    with pytest.raises(TimewebHTTPError) as exc_info:
+        await client.call_agent(agent_id="agent3", token="t3", message="q")
+    assert exc_info.value.status_code == 402
+    assert exc_info.value.error_code == "token_limit_exceeded"
+    assert native.call_count == 1
+    assert alt.call_count == 0
+    assert chat.call_count == 0
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_timeweb_client_4xx_tries_fallback_then_raises(
     settings: Settings, timeweb_base: str
 ):

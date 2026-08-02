@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from aiogram import Bot
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message
 
 from app.agents.context_relation import ContextRelationAgent
@@ -12,10 +13,12 @@ from app.agents.main_expert import MainExpertAgent
 from app.bot.formatting.telegram_html import format_response_html, split_html_message
 from app.bot.mention import AddressKind
 from app.config import Settings
+from app.db.models.entities import AnswerCache
 from app.db.repositories import Repository
 from app.domain.enums import ContextRelation, QuestionStatus
 from app.domain.messages import AGENT_ERROR, OFF_TOPIC
 from app.logging import get_logger
+from app.services.answer_cache import normalize_question_key
 from app.services.blocking_service import BlockingService
 from app.services.request_gate import GateOutcome, RequestGate
 from app.services.session_service import SessionService
@@ -89,12 +92,49 @@ class QuestionService:
         user_id = message.from_user.id  # type: ignore[union-attr]
         try:
             await bot.send_chat_action(message.chat.id, "typing")
+
+            # Standalone questions (not reply to bot): serve from cache before any agents.
+            if reply_session_id is None and self._cache_lookup_allowed(gate_result.question_text):
+                cache_key = normalize_question_key(gate_result.question_text)
+                cached = await repo.get_cached_answer(cache_key)
+                if cached is not None:
+                    await self._serve_cached_answer(
+                        repo,
+                        bot,
+                        message,
+                        update_id=update_id,
+                        user_id=user_id,
+                        question_text=gate_result.question_text,
+                        cache_key=cache_key,
+                        cached=cached,
+                    )
+                    return
+
             session, relation = await self.session_service.resolve_reply_session(
                 repo,
                 message,
                 bot_id=bot_id,
                 context_agent=self.context_relation,
             )
+
+            contextual = bool(relation and relation.include_previous_context)
+            if not contextual and self._cache_lookup_allowed(gate_result.question_text):
+                cache_key = normalize_question_key(gate_result.question_text)
+                cached = await repo.get_cached_answer(cache_key)
+                if cached is not None:
+                    await self._serve_cached_answer(
+                        repo,
+                        bot,
+                        message,
+                        update_id=update_id,
+                        user_id=user_id,
+                        question_text=gate_result.question_text,
+                        cache_key=cache_key,
+                        cached=cached,
+                        session=session,
+                        relation=relation.relation if relation else None,
+                    )
+                    return
 
             question = await repo.create_question(
                 session_id=session.id,
@@ -181,22 +221,7 @@ class QuestionService:
                 await self._fail_closed(bot, message, question.id, session.id, repo)
                 return
 
-            html_text = format_response_html(expert_result.text)
-            parts = split_html_message(html_text)
-            sent_message = await bot.send_message(
-                chat_id=message.chat.id,
-                text=parts[0],
-                parse_mode=ParseMode.HTML,
-                reply_to_message_id=message.message_id,
-                message_thread_id=message.message_thread_id,
-            )
-            for part in parts[1:]:
-                await bot.send_message(
-                    chat_id=message.chat.id,
-                    text=part,
-                    parse_mode=ParseMode.HTML,
-                    message_thread_id=message.message_thread_id,
-                )
+            sent_message = await self._send_answer_parts(bot, message, expert_result.text)
 
             if self.settings.store_bot_responses:
                 await repo.create_bot_response(
@@ -217,6 +242,20 @@ class QuestionService:
             if relation:
                 await repo.update_question_context_relation(question.id, relation.relation)
 
+            if self._should_store_cache(
+                contextual=contextual,
+                previous_answer=previous_answer,
+                question_text=gate_result.question_text,
+            ):
+                await self._store_answer_cache(
+                    repo,
+                    raw_question=gate_result.question_text,
+                    normalized_question=normalized,
+                    answer_text=expert_result.text,
+                    source_question_id=question.id,
+                    category=filter_result.category,
+                )
+
             logger.info(
                 "question_answered",
                 update_id=update_id,
@@ -227,6 +266,110 @@ class QuestionService:
             )
         finally:
             self.gate.release_concurrent(user_id)
+
+    def _cache_lookup_allowed(self, question_text: str) -> bool:
+        if not self.settings.answer_cache_enabled:
+            return False
+        key = normalize_question_key(question_text)
+        return len(key) >= self.settings.answer_cache_min_question_len
+
+    def _should_store_cache(
+        self,
+        *,
+        contextual: bool,
+        previous_answer: str | None,
+        question_text: str,
+    ) -> bool:
+        if not self.settings.answer_cache_enabled:
+            return False
+        if contextual or previous_answer:
+            return False
+        key = normalize_question_key(question_text)
+        return len(key) >= self.settings.answer_cache_min_question_len
+
+    async def _store_answer_cache(
+        self,
+        repo: Repository,
+        *,
+        raw_question: str,
+        normalized_question: str,
+        answer_text: str,
+        source_question_id,
+        category: str | None,
+    ) -> None:
+        keys: dict[str, str] = {}
+        raw_key = normalize_question_key(raw_question)
+        if len(raw_key) >= self.settings.answer_cache_min_question_len:
+            keys[raw_key] = raw_question
+        norm_key = normalize_question_key(normalized_question)
+        if len(norm_key) >= self.settings.answer_cache_min_question_len:
+            keys.setdefault(norm_key, normalized_question)
+
+        for key, display in keys.items():
+            await repo.upsert_cached_answer(
+                question_key=key,
+                question_text=display,
+                answer_text=answer_text,
+                source_question_id=source_question_id,
+                category=category,
+            )
+        logger.info("answer_cache_stored", keys=list(keys.keys()), category=category)
+
+    async def _serve_cached_answer(
+        self,
+        repo: Repository,
+        bot: Bot,
+        message: Message,
+        *,
+        update_id: int,
+        user_id: int,
+        question_text: str,
+        cache_key: str,
+        cached: AnswerCache,
+        session=None,
+        relation: str | None = None,
+    ) -> None:
+        if session is None:
+            session = await self.session_service.create_new_session(repo, message)
+
+        question = await repo.create_question(
+            session_id=session.id,
+            raw_question=question_text,
+            telegram_update_id=update_id,
+            telegram_message_id=message.message_id,
+            reply_to_message_id=(
+                message.reply_to_message.message_id if message.reply_to_message else None
+            ),
+        )
+        await repo.update_question_filter_result(
+            question.id,
+            normalized_question=cache_key,
+            category=cached.category,
+            filter_allowed=True,
+            status=QuestionStatus.ANSWERED,
+        )
+        if relation:
+            await repo.update_question_context_relation(question.id, relation)
+
+        sent_message = await self._send_answer_parts(bot, message, cached.answer_text)
+        if self.settings.store_bot_responses:
+            await repo.create_bot_response(
+                session_id=session.id,
+                question_id=question.id,
+                response_text=cached.answer_text,
+                telegram_message_id=sent_message.message_id,
+            )
+        await repo.update_session_last_bot_message(session.id, sent_message.message_id)
+        await repo.record_cache_hit(cache_key)
+        logger.info(
+            "answer_cache_hit",
+            update_id=update_id,
+            chat_id=message.chat.id,
+            user_id=user_id,
+            session_id=str(session.id),
+            cache_key=cache_key,
+            text_len=len(cached.answer_text),
+        )
 
     async def _fail_closed(
         self,
@@ -246,11 +389,59 @@ class QuestionService:
         await self.blocking_service.add_junk_score(repo, session_id, reason="agent_error", delta=0)
         await self._reply_text(bot, message, AGENT_ERROR)
 
+    async def _send_answer_parts(self, bot: Bot, message: Message, text: str):
+        html_text = format_response_html(text)
+        parts = split_html_message(html_text)
+        sent_message = await self._send_message(
+            bot,
+            message,
+            parts[0],
+            parse_mode=ParseMode.HTML,
+            reply=True,
+        )
+        for part in parts[1:]:
+            await self._send_message(
+                bot,
+                message,
+                part,
+                parse_mode=ParseMode.HTML,
+                reply=False,
+            )
+        return sent_message
+
     @staticmethod
     async def _reply_text(bot: Bot, message: Message, text: str) -> None:
-        await bot.send_message(
-            chat_id=message.chat.id,
-            text=text,
-            reply_to_message_id=message.message_id,
-            message_thread_id=message.message_thread_id,
-        )
+        await QuestionService._send_message(bot, message, text, reply=True)
+
+    @staticmethod
+    async def _send_message(
+        bot: Bot,
+        message: Message,
+        text: str,
+        *,
+        reply: bool = False,
+        parse_mode: ParseMode | None = None,
+    ):
+        kwargs: dict = {
+            "chat_id": message.chat.id,
+            "text": text,
+            "message_thread_id": message.message_thread_id,
+        }
+        if parse_mode is not None:
+            kwargs["parse_mode"] = parse_mode
+        if reply:
+            kwargs["reply_to_message_id"] = message.message_id
+            try:
+                return await bot.send_message(**kwargs)
+            except TelegramBadRequest as exc:
+                description = str(exc).lower()
+                if "message to be replied not found" not in description:
+                    raise
+                logger.warning(
+                    "telegram_reply_fallback",
+                    chat_id=message.chat.id,
+                    message_id=message.message_id,
+                    error=str(exc),
+                )
+                kwargs.pop("reply_to_message_id", None)
+        return await bot.send_message(**kwargs)

@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models.entities import (
     AIUsageEvent,
+    AnswerCache,
     BlockEvent,
     BotResponse,
     ChatSession,
@@ -283,6 +284,49 @@ class Repository:
         )
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none() is not None
+
+    # --- Answer cache ---
+
+    async def get_cached_answer(self, question_key: str) -> AnswerCache | None:
+        stmt = select(AnswerCache).where(AnswerCache.question_key == question_key).limit(1)
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def record_cache_hit(self, question_key: str) -> None:
+        stmt = (
+            update(AnswerCache)
+            .where(AnswerCache.question_key == question_key)
+            .values(
+                hit_count=AnswerCache.hit_count + 1,
+                last_hit_at=datetime.now(UTC),
+            )
+        )
+        await self.session.execute(stmt)
+
+    async def upsert_cached_answer(
+        self,
+        *,
+        question_key: str,
+        question_text: str,
+        answer_text: str,
+        source_question_id: uuid.UUID | None = None,
+        category: str | None = None,
+    ) -> None:
+        """Insert a cache row; keep the first stored answer on conflict."""
+        stmt = (
+            insert(AnswerCache)
+            .values(
+                id=uuid.uuid4(),
+                question_key=question_key,
+                question_text=question_text,
+                answer_text=answer_text,
+                category=category,
+                source_question_id=source_question_id,
+                hit_count=0,
+            )
+            .on_conflict_do_nothing(index_elements=["question_key"])
+        )
+        await self.session.execute(stmt)
 
     # --- Processed updates ---
 
