@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import suppress
+
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import Message
@@ -61,10 +63,8 @@ class AccessService:
                 reason="starting_credits",
                 admin_telegram_user_id=admin_telegram_user_id,
             )
-        try:
+        with suppress(TelegramAPIError):
             await bot.send_message(telegram_user_id, ACCESS_APPROVED)
-        except TelegramAPIError:
-            pass
         return user
 
     async def reject(

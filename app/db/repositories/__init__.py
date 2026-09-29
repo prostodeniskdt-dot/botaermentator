@@ -21,8 +21,8 @@ from app.db.models.entities import (
     ProcessedUpdate,
     RateLimitCounter,
     SystemSetting,
-    TelegramUser,
     TelegramUpdateJob,
+    TelegramUser,
     UserFeedback,
     UserQuestion,
 )

@@ -52,11 +52,8 @@ def test_ready_not_ready_in_production_without_critical_env(
 
     clear_settings_cache()
     app = create_app()
-    with TestClient(app) as test_client:
-        health = test_client.get("/health")
-        ready = test_client.get("/ready")
-
-    assert health.status_code == 200
-    assert ready.status_code == 503
-    assert ready.json()["status"] == "not_ready"
-    assert ready.json()["checks"]["critical_env"] is False
+    with (
+        pytest.raises(RuntimeError, match="Missing critical production settings"),
+        TestClient(app),
+    ):
+        pass
