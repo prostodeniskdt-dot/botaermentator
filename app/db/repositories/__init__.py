@@ -10,17 +10,30 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models.entities import (
+    AccessEvent,
     AIUsageEvent,
     AnswerCache,
     BlockEvent,
     BotResponse,
     ChatSession,
+    CreditAccount,
+    CreditTransaction,
     ProcessedUpdate,
     RateLimitCounter,
     TelegramUser,
+    UserFeedback,
     UserQuestion,
 )
-from app.domain.enums import BlockAction, BlockTargetType, RateLimitWindow, SessionStatus
+from app.domain.enums import (
+    AccessStatus,
+    BlockAction,
+    BlockTargetType,
+    CreditTransactionStatus,
+    CreditTransactionType,
+    RateLimitWindow,
+    ResponseMode,
+    SessionStatus,
+)
 
 
 class Repository:
@@ -65,6 +78,67 @@ class Repository:
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def list_users_by_access_status(
+        self, status: AccessStatus | str, *, limit: int = 50
+    ) -> list[TelegramUser]:
+        stmt = (
+            select(TelegramUser)
+            .where(TelegramUser.access_status == str(status))
+            .order_by(TelegramUser.created_at)
+            .limit(limit)
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars())
+
+    async def set_user_access(
+        self,
+        telegram_user_id: int,
+        status: AccessStatus | str,
+        *,
+        admin_telegram_user_id: int | None = None,
+        reason: str | None = None,
+    ) -> TelegramUser | None:
+        user = await self.get_user_by_telegram_id(telegram_user_id)
+        if user is None:
+            return None
+        old_status = user.access_status
+        new_status = str(status)
+        user.access_status = new_status
+        user.is_blocked = new_status == AccessStatus.BLOCKED
+        user.blocked_at = datetime.now(UTC) if user.is_blocked else None
+        user.block_reason = reason if user.is_blocked else None
+        if new_status == AccessStatus.ACTIVE:
+            user.approved_at = datetime.now(UTC)
+            user.approved_by = admin_telegram_user_id
+        self.session.add(
+            AccessEvent(
+                telegram_user_id=telegram_user_id,
+                old_status=old_status,
+                new_status=new_status,
+                admin_telegram_user_id=admin_telegram_user_id,
+                reason=reason,
+            )
+        )
+        await self.session.flush()
+        return user
+
+    async def set_user_response_mode(
+        self, telegram_user_id: int, mode: ResponseMode | str
+    ) -> TelegramUser | None:
+        user = await self.get_user_by_telegram_id(telegram_user_id)
+        if user is None:
+            return None
+        user.response_mode = str(mode)
+        await self.session.flush()
+        return user
+
+    async def clear_user_memory(self, telegram_user_id: int) -> None:
+        user = await self.get_user_by_telegram_id(telegram_user_id)
+        if user is not None:
+            user.memory_summary = None
+            user.profile_facts = {}
+        await self.close_private_sessions(telegram_user_id)
+
     async def set_user_blocked(
         self,
         telegram_user_id: int,
@@ -76,9 +150,24 @@ class Repository:
         user = await self.get_user_by_telegram_id(telegram_user_id)
         if user is None:
             return None
+        old_access_status = user.access_status
         user.is_blocked = blocked
         user.blocked_at = datetime.now(UTC) if blocked else None
         user.block_reason = reason if blocked else None
+        if blocked:
+            user.access_status = AccessStatus.BLOCKED
+        elif old_access_status == AccessStatus.BLOCKED:
+            user.access_status = AccessStatus.ACTIVE
+        if user.access_status != old_access_status:
+            self.session.add(
+                AccessEvent(
+                    telegram_user_id=telegram_user_id,
+                    old_status=old_access_status,
+                    new_status=user.access_status,
+                    admin_telegram_user_id=admin_telegram_user_id,
+                    reason=reason,
+                )
+            )
         await self.record_block_event(
             target_type=BlockTargetType.USER,
             target_id=str(telegram_user_id),
@@ -97,17 +186,46 @@ class Repository:
         telegram_user_id: int,
         message_thread_id: int | None = None,
         root_user_message_id: int | None = None,
+        is_private: bool = False,
     ) -> ChatSession:
         session_obj = ChatSession(
             chat_id=chat_id,
             telegram_user_id=telegram_user_id,
             message_thread_id=message_thread_id,
             root_user_message_id=root_user_message_id,
+            is_private=is_private,
             status=SessionStatus.ACTIVE,
         )
         self.session.add(session_obj)
         await self.session.flush()
         return session_obj
+
+    async def get_active_private_session(self, telegram_user_id: int) -> ChatSession | None:
+        stmt = (
+            select(ChatSession)
+            .where(
+                ChatSession.telegram_user_id == telegram_user_id,
+                ChatSession.is_private.is_(True),
+                ChatSession.status == SessionStatus.ACTIVE,
+                ChatSession.closed_at.is_(None),
+            )
+            .order_by(ChatSession.updated_at.desc())
+            .limit(1)
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def close_private_sessions(self, telegram_user_id: int) -> None:
+        stmt = (
+            update(ChatSession)
+            .where(
+                ChatSession.telegram_user_id == telegram_user_id,
+                ChatSession.is_private.is_(True),
+                ChatSession.closed_at.is_(None),
+            )
+            .values(status=SessionStatus.PAUSED, closed_at=datetime.now(UTC))
+        )
+        await self.session.execute(stmt)
 
     async def get_session(self, session_id: uuid.UUID) -> ChatSession | None:
         stmt = select(ChatSession).where(ChatSession.id == session_id)
@@ -162,6 +280,8 @@ class Repository:
         telegram_update_id: int | None = None,
         telegram_message_id: int | None = None,
         reply_to_message_id: int | None = None,
+        request_id: uuid.UUID | None = None,
+        response_mode: ResponseMode | str = ResponseMode.QUICK,
     ) -> UserQuestion:
         question = UserQuestion(
             session_id=session_id,
@@ -169,10 +289,19 @@ class Repository:
             telegram_update_id=telegram_update_id,
             telegram_message_id=telegram_message_id,
             reply_to_message_id=reply_to_message_id,
+            request_id=request_id or uuid.uuid4(),
+            response_mode=str(response_mode),
         )
         self.session.add(question)
         await self.session.flush()
         return question
+
+    async def set_question_credits_charged(self, question_id: uuid.UUID, amount: int) -> None:
+        await self.session.execute(
+            update(UserQuestion)
+            .where(UserQuestion.id == question_id)
+            .values(credits_charged=amount)
+        )
 
     async def update_question_filter_result(
         self,
@@ -241,6 +370,21 @@ class Repository:
         r_result = await self.session.execute(r_stmt)
         response = r_result.scalar_one_or_none()
         return question, response
+
+    async def get_recent_qa_for_session(
+        self, session_id: uuid.UUID, *, limit: int
+    ) -> list[tuple[UserQuestion, BotResponse]]:
+        stmt = (
+            select(UserQuestion, BotResponse)
+            .join(BotResponse, BotResponse.question_id == UserQuestion.id)
+            .where(UserQuestion.session_id == session_id, UserQuestion.status == "answered")
+            .order_by(UserQuestion.created_at.desc())
+            .limit(limit)
+        )
+        result = await self.session.execute(stmt)
+        rows = list(result.all())
+        rows.reverse()
+        return rows
 
     async def create_bot_response(
         self,
@@ -351,12 +495,214 @@ class Repository:
         start = day_start or datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
         end = start + timedelta(days=1)
         stmt = select(
-            func.coalesce(func.sum(AIUsageEvent.estimated_cost_rub), 0.0),
-            func.coalesce(func.sum(AIUsageEvent.actual_cost_rub), 0.0),
+            func.coalesce(
+                func.sum(
+                    func.coalesce(
+                        AIUsageEvent.actual_cost_rub,
+                        AIUsageEvent.estimated_cost_rub,
+                    )
+                ),
+                0.0,
+            )
         ).where(AIUsageEvent.started_at >= start, AIUsageEvent.started_at < end)
         result = await self.session.execute(stmt)
-        estimated, actual = result.one()
-        return float(actual or 0.0) + float(estimated or 0.0)
+        return float(result.scalar_one() or 0.0)
+
+    # --- Credits ---
+
+    async def get_or_create_credit_account(
+        self, telegram_user_id: int, *, initial_balance: int = 0
+    ) -> CreditAccount:
+        stmt = (
+            insert(CreditAccount)
+            .values(
+                id=uuid.uuid4(),
+                telegram_user_id=telegram_user_id,
+                balance=initial_balance,
+                reserved=0,
+            )
+            .on_conflict_do_nothing(index_elements=["telegram_user_id"])
+        )
+        await self.session.execute(stmt)
+        result = await self.session.execute(
+            select(CreditAccount).where(CreditAccount.telegram_user_id == telegram_user_id)
+        )
+        return result.scalar_one()
+
+    async def grant_credits(
+        self,
+        telegram_user_id: int,
+        amount: int,
+        *,
+        reason: str,
+        admin_telegram_user_id: int | None = None,
+    ) -> CreditAccount:
+        if amount <= 0:
+            raise ValueError("Credit grant must be positive")
+        account = await self.get_or_create_credit_account(telegram_user_id)
+        account.balance += amount
+        self.session.add(
+            CreditTransaction(
+                telegram_user_id=telegram_user_id,
+                transaction_type=CreditTransactionType.GRANT,
+                status=CreditTransactionStatus.COMMITTED,
+                amount=amount,
+                balance_after=account.balance,
+                reason=reason,
+                admin_telegram_user_id=admin_telegram_user_id,
+            )
+        )
+        await self.session.flush()
+        return account
+
+    async def reserve_credits(
+        self, telegram_user_id: int, request_id: uuid.UUID, amount: int
+    ) -> bool:
+        existing = await self.session.execute(
+            select(CreditTransaction).where(
+                CreditTransaction.request_id == request_id,
+                CreditTransaction.transaction_type == CreditTransactionType.RESERVATION,
+            )
+        )
+        if existing.scalar_one_or_none() is not None:
+            return True
+        await self.get_or_create_credit_account(telegram_user_id)
+        stmt = (
+            update(CreditAccount)
+            .where(
+                CreditAccount.telegram_user_id == telegram_user_id,
+                CreditAccount.balance - CreditAccount.reserved >= amount,
+            )
+            .values(reserved=CreditAccount.reserved + amount, updated_at=func.now())
+            .returning(CreditAccount.balance)
+        )
+        result = await self.session.execute(stmt)
+        balance = result.scalar_one_or_none()
+        if balance is None:
+            return False
+        self.session.add(
+            CreditTransaction(
+                telegram_user_id=telegram_user_id,
+                request_id=request_id,
+                transaction_type=CreditTransactionType.RESERVATION,
+                status=CreditTransactionStatus.PENDING,
+                amount=amount,
+                balance_after=balance,
+                reason="answer_reservation",
+            )
+        )
+        await self.session.flush()
+        return True
+
+    async def commit_credit_reservation(
+        self, telegram_user_id: int, request_id: uuid.UUID, amount: int
+    ) -> None:
+        existing = await self.session.execute(
+            select(CreditTransaction).where(
+                CreditTransaction.request_id == request_id,
+                CreditTransaction.transaction_type == CreditTransactionType.CHARGE,
+            )
+        )
+        if existing.scalar_one_or_none() is not None:
+            return
+        result = await self.session.execute(
+            update(CreditAccount)
+            .where(
+                CreditAccount.telegram_user_id == telegram_user_id,
+                CreditAccount.reserved >= amount,
+            )
+            .values(
+                balance=CreditAccount.balance - amount,
+                reserved=CreditAccount.reserved - amount,
+                updated_at=func.now(),
+            )
+            .returning(CreditAccount.balance)
+        )
+        balance = result.scalar_one()
+        await self.session.execute(
+            update(CreditTransaction)
+            .where(
+                CreditTransaction.request_id == request_id,
+                CreditTransaction.transaction_type == CreditTransactionType.RESERVATION,
+            )
+            .values(status=CreditTransactionStatus.COMMITTED)
+        )
+        self.session.add(
+            CreditTransaction(
+                telegram_user_id=telegram_user_id,
+                request_id=request_id,
+                transaction_type=CreditTransactionType.CHARGE,
+                status=CreditTransactionStatus.COMMITTED,
+                amount=-amount,
+                balance_after=balance,
+                reason="answer_completed",
+            )
+        )
+        await self.session.flush()
+
+    async def release_credit_reservation(
+        self, telegram_user_id: int, request_id: uuid.UUID, amount: int
+    ) -> None:
+        existing = await self.session.execute(
+            select(CreditTransaction).where(
+                CreditTransaction.request_id == request_id,
+                CreditTransaction.transaction_type == CreditTransactionType.RELEASE,
+            )
+        )
+        if existing.scalar_one_or_none() is not None:
+            return
+        result = await self.session.execute(
+            update(CreditAccount)
+            .where(
+                CreditAccount.telegram_user_id == telegram_user_id,
+                CreditAccount.reserved >= amount,
+            )
+            .values(reserved=CreditAccount.reserved - amount, updated_at=func.now())
+            .returning(CreditAccount.balance)
+        )
+        balance = result.scalar_one_or_none()
+        if balance is None:
+            return
+        await self.session.execute(
+            update(CreditTransaction)
+            .where(
+                CreditTransaction.request_id == request_id,
+                CreditTransaction.transaction_type == CreditTransactionType.RESERVATION,
+            )
+            .values(status=CreditTransactionStatus.RELEASED)
+        )
+        self.session.add(
+            CreditTransaction(
+                telegram_user_id=telegram_user_id,
+                request_id=request_id,
+                transaction_type=CreditTransactionType.RELEASE,
+                status=CreditTransactionStatus.COMMITTED,
+                amount=amount,
+                balance_after=balance,
+                reason="answer_failed",
+            )
+        )
+        await self.session.flush()
+
+    async def add_feedback(
+        self,
+        telegram_user_id: int,
+        question_id: uuid.UUID,
+        rating: int,
+        *,
+        reason: str | None = None,
+        comment: str | None = None,
+    ) -> UserFeedback:
+        feedback = UserFeedback(
+            telegram_user_id=telegram_user_id,
+            question_id=question_id,
+            rating=rating,
+            reason=reason,
+            comment=comment,
+        )
+        self.session.add(feedback)
+        await self.session.flush()
+        return feedback
 
     # --- Rate limits ---
 

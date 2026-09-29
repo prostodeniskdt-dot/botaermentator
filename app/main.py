@@ -137,7 +137,7 @@ async def _register_webhook(bot, settings, logger) -> None:
     await bot.set_webhook(
         url=settings.telegram_webhook_url,
         secret_token=settings.telegram_webhook_secret,
-        allowed_updates=["message", "my_chat_member"],
+        allowed_updates=["message", "callback_query", "my_chat_member"],
         drop_pending_updates=False,
     )
     logger.info("telegram_webhook_registered", url=settings.telegram_webhook_url)

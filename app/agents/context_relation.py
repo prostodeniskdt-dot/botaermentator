@@ -51,7 +51,22 @@ class ContextRelationAgent:
                 message=message,
             )
             await self._record_usage(repo, session_id, question_id, started, call, success=True)
-            parsed = self._parse_with_retry(call.message)
+            parsed = self._parse(call.message)
+            if parsed is not None:
+                return parsed
+            retry_started = datetime.now(UTC)
+            retry = await self.client.call_agent(
+                agent_id=self.settings.timeweb_agent_2_id,
+                token=self.settings.timeweb_agent_2_token,
+                message=(
+                    f"{message}\n\nYour previous response was invalid. Return ONLY valid JSON "
+                    "matching the requested schema."
+                ),
+            )
+            await self._record_usage(
+                repo, session_id, question_id, retry_started, retry, success=True
+            )
+            parsed = self._parse(retry.message)
             if parsed is not None:
                 return parsed
         except TimewebClientError as exc:
@@ -68,17 +83,9 @@ class ContextRelationAgent:
 
         return self._standalone_fallback(current_question)
 
-    def _parse_with_retry(self, text: str) -> ContextRelationResult | None:
+    def _parse(self, text: str) -> ContextRelationResult | None:
         try:
             parsed = parse_agent_json(text, ContextRelationResult)
-            return parsed  # type: ignore[return-value]
-        except AgentParseError:
-            pass
-        try:
-            parsed = parse_agent_json(
-                "Return ONLY valid JSON.\n\n" + text,
-                ContextRelationResult,
-            )
             return parsed  # type: ignore[return-value]
         except AgentParseError as exc:
             logger.warning("agent2_parse_failed", error=str(exc))
@@ -121,6 +128,8 @@ class ContextRelationAgent:
             output_tokens=getattr(call, "output_tokens", None),
             actual_cost_rub=getattr(call, "actual_cost_rub", None),
             estimated_cost_rub=self.settings.agent_2_estimated_cost_rub,
+            transport=getattr(call, "transport", None),
+            attempt_number=getattr(call, "attempt_number", 1),
             error_code=error_code,
         )
         await repo.record_usage_event(event)

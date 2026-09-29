@@ -74,6 +74,7 @@ class RequestGate:
         bot_username: str,
         bot_id: int,
         reply_session_id: object | None = None,
+        enforce_allowed_chat: bool = True,
     ) -> GateResult:
         if message.from_user is None or message.from_user.is_bot:
             return GateResult(outcome=GateOutcome.REJECT, user_message=EMPTY_QUESTION)
@@ -82,6 +83,8 @@ class RequestGate:
             return GateResult(outcome=GateOutcome.DUPLICATE_UPDATE)
 
         if (
+            enforce_allowed_chat
+            and
             self.settings.allowed_chat_id is not None
             and message.chat.id != self.settings.allowed_chat_id
         ):

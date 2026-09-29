@@ -79,6 +79,18 @@ class Settings(BaseSettings):
 
     rich_messages_enabled: bool = True
 
+    private_access_enabled: bool = True
+    access_contact_username: str = "pprostodenis"
+    notify_admin_on_access_request: bool = True
+    starting_credits: int = 5
+    quick_mode_credits: int = 1
+    deep_mode_credits: int = 5
+    quick_max_output_tokens: int = 600
+    deep_max_output_tokens: int = 2200
+    private_context_turns: int = 6
+    knowledge_base_version: str = "1"
+    prompt_version: str = "1"
+
     @field_validator("admin_user_ids", mode="before")
     @classmethod
     def parse_admin_user_ids(cls, value: object) -> list[int]:

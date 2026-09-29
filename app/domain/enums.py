@@ -9,6 +9,32 @@ class AgentType(StrEnum):
     MAIN_EXPERT = "main_expert"
 
 
+class AccessStatus(StrEnum):
+    PENDING = "pending"
+    ACTIVE = "active"
+    REJECTED = "rejected"
+    BLOCKED = "blocked"
+
+
+class ResponseMode(StrEnum):
+    QUICK = "quick"
+    DEEP = "deep"
+
+
+class CreditTransactionType(StrEnum):
+    GRANT = "grant"
+    ADJUSTMENT = "adjustment"
+    RESERVATION = "reservation"
+    CHARGE = "charge"
+    RELEASE = "release"
+
+
+class CreditTransactionStatus(StrEnum):
+    PENDING = "pending"
+    COMMITTED = "committed"
+    RELEASED = "released"
+
+
 class SessionStatus(StrEnum):
     ACTIVE = "active"
     PAUSED = "paused"

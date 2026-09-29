@@ -10,6 +10,7 @@ from aiogram.types import Message
 
 from app.db.repositories import Repository
 from app.db.session import session_scope
+from app.domain.enums import AccessStatus
 from app.services.usage_service import UsageService
 
 router = Router(name="admin")
@@ -135,3 +136,116 @@ async def admin_kill_switch_off(message: Message, settings) -> None:
         return
     settings.ai_processing_enabled = True
     await message.answer("AI processing enabled.")
+
+
+@router.message(F.chat.type == "private", Command("admin_pending"))
+async def admin_pending(message: Message, settings) -> None:
+    if not _is_admin(message, settings):
+        return
+    async with session_scope() as db:
+        users = await Repository(db).list_users_by_access_status(AccessStatus.PENDING)
+    if not users:
+        await message.answer("Нет ожидающих заявок.")
+        return
+    lines = ["Ожидают доступа:"]
+    for user in users:
+        username = f"@{user.username}" if user.username else "без username"
+        lines.append(f"{user.telegram_user_id} — {username} — {user.first_name or ''}")
+    await message.answer("\n".join(lines))
+
+
+@router.message(F.chat.type == "private", Command("admin_allow"))
+async def admin_allow(message: Message, settings, access_service, bot) -> None:
+    if not _is_admin(message, settings):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2:
+        await message.answer("Usage: /admin_allow <telegram_user_id>")
+        return
+    user_id = int(parts[1])
+    async with session_scope() as db:
+        user = await access_service.approve(
+            Repository(db),
+            bot,
+            user_id,
+            admin_telegram_user_id=message.from_user.id,  # type: ignore[union-attr]
+        )
+    if user is None:
+        await message.answer("Пользователь не найден. Сначала он должен запустить бота.")
+        return
+    await message.answer(f"Доступ пользователю {user_id} открыт.")
+
+
+@router.message(F.chat.type == "private", Command("admin_reject"))
+async def admin_reject(message: Message, settings, access_service) -> None:
+    if not _is_admin(message, settings):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2:
+        await message.answer("Usage: /admin_reject <telegram_user_id>")
+        return
+    user_id = int(parts[1])
+    async with session_scope() as db:
+        user = await access_service.reject(
+            Repository(db),
+            user_id,
+            admin_telegram_user_id=message.from_user.id,  # type: ignore[union-attr]
+        )
+    await message.answer(
+        f"Заявка пользователя {user_id} отклонена."
+        if user
+        else "Пользователь не найден."
+    )
+
+
+@router.message(F.chat.type == "private", Command("admin_grant_credits"))
+async def admin_grant_credits(message: Message, settings) -> None:
+    if not _is_admin(message, settings):
+        return
+    parts = (message.text or "").split(maxsplit=3)
+    if len(parts) < 3:
+        await message.answer(
+            "Usage: /admin_grant_credits <telegram_user_id> <amount> [reason]"
+        )
+        return
+    user_id = int(parts[1])
+    amount = int(parts[2])
+    reason = parts[3] if len(parts) > 3 else "manual_grant"
+    async with session_scope() as db:
+        repo = Repository(db)
+        if await repo.get_user_by_telegram_id(user_id) is None:
+            await message.answer("Пользователь не найден.")
+            return
+        account = await repo.grant_credits(
+            user_id,
+            amount,
+            reason=reason,
+            admin_telegram_user_id=message.from_user.id,  # type: ignore[union-attr]
+        )
+    await message.answer(f"Начислено {amount}. Баланс пользователя: {account.balance}.")
+
+
+@router.message(F.chat.type == "private", Command("admin_user"))
+async def admin_user(message: Message, settings) -> None:
+    if not _is_admin(message, settings):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2:
+        await message.answer("Usage: /admin_user <telegram_user_id>")
+        return
+    user_id = int(parts[1])
+    async with session_scope() as db:
+        repo = Repository(db)
+        user = await repo.get_user_by_telegram_id(user_id)
+        account = await repo.get_or_create_credit_account(user_id) if user else None
+    if user is None:
+        await message.answer("Пользователь не найден.")
+        return
+    await message.answer(
+        f"ID: {user.telegram_user_id}\n"
+        f"Username: @{user.username or '-'}\n"
+        f"Доступ: {user.access_status}\n"
+        f"Режим: {user.response_mode}\n"
+        f"Баланс: {account.balance}\n"
+        f"Резерв: {account.reserved}"
+    )

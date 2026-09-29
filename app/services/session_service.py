@@ -25,7 +25,33 @@ class SessionService:
             telegram_user_id=message.from_user.id,  # type: ignore[union-attr]
             message_thread_id=message.message_thread_id,
             root_user_message_id=message.message_id,
+            is_private=message.chat.type == "private",
         )
+
+    async def resolve_private_session(
+        self,
+        repo: Repository,
+        message: Message,
+        *,
+        context_agent: ContextRelationAgent,
+    ) -> tuple[object, ContextRelationResult | None]:
+        user_id = message.from_user.id  # type: ignore[union-attr]
+        session = await repo.get_active_private_session(user_id)
+        if session is None:
+            return await self.create_new_session(repo, message), None
+
+        prev_q, prev_a = await repo.get_previous_qa_for_session(session.id)
+        if prev_q is None or prev_a is None:
+            return session, None
+        relation = await context_agent.evaluate(
+            repo,
+            current_question=message.text or message.caption or "",
+            previous_question=prev_q.normalized_question or prev_q.raw_question,
+            previous_answer=prev_a.response_text,
+            session_id=session.id,
+            question_id=None,
+        )
+        return session, relation
 
     async def resolve_reply_session(
         self,
