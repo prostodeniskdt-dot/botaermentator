@@ -87,12 +87,8 @@ def upgrade() -> None:
         "ai_usage_events",
         sa.Column("attempt_number", sa.Integer(), server_default="1", nullable=False),
     )
-    op.add_column(
-        "ai_usage_events", sa.Column("transport", sa.String(length=64), nullable=True)
-    )
-    op.add_column(
-        "ai_usage_events", sa.Column("model_name", sa.String(length=128), nullable=True)
-    )
+    op.add_column("ai_usage_events", sa.Column("transport", sa.String(length=64), nullable=True))
+    op.add_column("ai_usage_events", sa.Column("model_name", sa.String(length=128), nullable=True))
     op.create_index("ix_ai_usage_events_request_id", "ai_usage_events", ["request_id"])
 
     op.create_table(
@@ -116,9 +112,7 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("telegram_user_id"),
     )
-    op.create_index(
-        "ix_credit_accounts_telegram_user_id", "credit_accounts", ["telegram_user_id"]
-    )
+    op.create_index("ix_credit_accounts_telegram_user_id", "credit_accounts", ["telegram_user_id"])
 
     op.create_table(
         "credit_transactions",
@@ -181,13 +175,9 @@ def upgrade() -> None:
         ),
         sa.ForeignKeyConstraint(["question_id"], ["user_questions.id"]),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint(
-            "telegram_user_id", "question_id", name="uq_feedback_user_question"
-        ),
+        sa.UniqueConstraint("telegram_user_id", "question_id", name="uq_feedback_user_question"),
     )
-    op.create_index(
-        "ix_user_feedback_telegram_user_id", "user_feedback", ["telegram_user_id"]
-    )
+    op.create_index("ix_user_feedback_telegram_user_id", "user_feedback", ["telegram_user_id"])
     op.create_index("ix_user_feedback_question_id", "user_feedback", ["question_id"])
 
 

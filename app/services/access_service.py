@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramAPIError
 from aiogram.types import Message
 
 from app.config import Settings
@@ -25,9 +26,11 @@ class AccessService:
             first_name=sender.first_name,
             last_name=sender.last_name,
         )
+        is_new_request = await repo.record_access_request(sender.id)
         if (
             self.settings.notify_admin_on_access_request
             and user.access_status == AccessStatus.PENDING
+            and is_new_request
         ):
             await self._notify_admins(bot, user)
         return user
@@ -47,15 +50,21 @@ class AccessService:
         )
         if user is None:
             return None
-        account = await repo.get_or_create_credit_account(telegram_user_id)
-        if account.balance == 0 and self.settings.starting_credits > 0:
+        await repo.get_or_create_credit_account(telegram_user_id)
+        has_starting_grant = await repo.has_credit_grant_reason(
+            telegram_user_id, "starting_credits"
+        )
+        if not has_starting_grant and self.settings.starting_credits > 0:
             await repo.grant_credits(
                 telegram_user_id,
                 self.settings.starting_credits,
                 reason="starting_credits",
                 admin_telegram_user_id=admin_telegram_user_id,
             )
-        await bot.send_message(telegram_user_id, ACCESS_APPROVED)
+        try:
+            await bot.send_message(telegram_user_id, ACCESS_APPROVED)
+        except TelegramAPIError:
+            pass
         return user
 
     async def reject(
@@ -83,4 +92,7 @@ class AccessService:
             f"/admin_reject {user.telegram_user_id}"
         )
         for admin_id in self.settings.admin_user_ids:
-            await bot.send_message(admin_id, text)
+            try:
+                await bot.send_message(admin_id, text)
+            except TelegramAPIError:
+                continue

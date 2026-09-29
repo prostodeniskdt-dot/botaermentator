@@ -24,8 +24,12 @@ def _is_admin(message: Message, settings) -> bool:
 async def admin_status(message: Message, settings) -> None:
     if not _is_admin(message, settings):
         return
+    async with session_scope() as db:
+        enabled = await Repository(db).get_system_setting(
+            "ai_processing_enabled", settings.ai_processing_enabled
+        )
     lines = [
-        f"AI enabled: {settings.ai_processing_enabled}",
+        f"AI enabled: {enabled}",
         f"Allowed chat: {settings.allowed_chat_id}",
         f"Budget RUB/day: {settings.daily_ai_budget_rub}",
     ]
@@ -126,7 +130,12 @@ async def admin_unblock_session(message: Message, settings, blocking_service) ->
 async def admin_kill_switch_on(message: Message, settings) -> None:
     if not _is_admin(message, settings):
         return
-    settings.ai_processing_enabled = False
+    async with session_scope() as db:
+        await Repository(db).set_system_setting(
+            "ai_processing_enabled",
+            False,
+            admin_telegram_user_id=message.from_user.id,  # type: ignore[union-attr]
+        )
     await message.answer("AI processing disabled.")
 
 
@@ -134,7 +143,12 @@ async def admin_kill_switch_on(message: Message, settings) -> None:
 async def admin_kill_switch_off(message: Message, settings) -> None:
     if not _is_admin(message, settings):
         return
-    settings.ai_processing_enabled = True
+    async with session_scope() as db:
+        await Repository(db).set_system_setting(
+            "ai_processing_enabled",
+            True,
+            admin_telegram_user_id=message.from_user.id,  # type: ignore[union-attr]
+        )
     await message.answer("AI processing enabled.")
 
 
@@ -192,9 +206,7 @@ async def admin_reject(message: Message, settings, access_service) -> None:
             admin_telegram_user_id=message.from_user.id,  # type: ignore[union-attr]
         )
     await message.answer(
-        f"Заявка пользователя {user_id} отклонена."
-        if user
-        else "Пользователь не найден."
+        f"Заявка пользователя {user_id} отклонена." if user else "Пользователь не найден."
     )
 
 
@@ -204,9 +216,7 @@ async def admin_grant_credits(message: Message, settings) -> None:
         return
     parts = (message.text or "").split(maxsplit=3)
     if len(parts) < 3:
-        await message.answer(
-            "Usage: /admin_grant_credits <telegram_user_id> <amount> [reason]"
-        )
+        await message.answer("Usage: /admin_grant_credits <telegram_user_id> <amount> [reason]")
         return
     user_id = int(parts[1])
     amount = int(parts[2])

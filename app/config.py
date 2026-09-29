@@ -88,8 +88,12 @@ class Settings(BaseSettings):
     quick_max_output_tokens: int = 600
     deep_max_output_tokens: int = 2200
     private_context_turns: int = 6
+    private_memory_max_chars: int = 6000
     knowledge_base_version: str = "1"
     prompt_version: str = "1"
+    durable_update_queue_enabled: bool = False
+    update_queue_poll_seconds: float = 0.5
+    update_queue_max_attempts: int = 3
 
     @field_validator("admin_user_ids", mode="before")
     @classmethod
@@ -257,8 +261,7 @@ def _strip_surrounding_quotes(value: str) -> str:
 
 def _clean_ssl_query_values(query: dict[str, list[str]]) -> dict[str, list[str]]:
     return {
-        key: [_strip_surrounding_quotes(value) for value in values]
-        for key, values in query.items()
+        key: [_strip_surrounding_quotes(value) for value in values] for key, values in query.items()
     }
 
 

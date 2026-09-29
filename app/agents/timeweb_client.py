@@ -84,9 +84,7 @@ class TimewebClient:
         retryable_failure = False
         for attempt in range(1, attempts + 1):
             retryable_failure = False
-            for mode, url, payload in self._request_variants(
-                agent_id, message, max_output_tokens
-            ):
+            for mode, url, payload in self._request_variants(agent_id, message, max_output_tokens):
                 started = time.perf_counter()
                 try:
                     result = await self._post_once(url, headers, payload, started)

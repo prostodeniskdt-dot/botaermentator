@@ -7,7 +7,13 @@ import uuid
 from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
-from aiogram.types import InputRichMessage, Message, ReplyParameters
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputRichMessage,
+    Message,
+    ReplyParameters,
+)
 
 from app.agents.context_relation import ContextRelationAgent
 from app.agents.industry_filter import IndustryFilterAgent
@@ -299,14 +305,22 @@ class QuestionService:
             )
 
             conversation_history: list[tuple[str, str]] = []
+            user_memory: str | None = None
             if is_private:
-                history_rows = await repo.get_recent_qa_for_session(
-                    session.id, limit=self.settings.private_context_turns
-                )
-                conversation_history = [
-                    (row_question.raw_question, row_answer.response_text)
-                    for row_question, row_answer in history_rows
-                ]
+                if not session.summary:
+                    history_rows = await repo.get_recent_qa_for_session(
+                        session.id, limit=self.settings.private_context_turns
+                    )
+                    conversation_history = [
+                        (row_question.raw_question, row_answer.response_text)
+                        for row_question, row_answer in history_rows
+                    ]
+                user = await repo.get_user_by_telegram_id(user_id)
+                if user is not None:
+                    facts = user.profile_facts.get("confirmed", [])
+                    user_memory = "\n".join(f"- {fact}" for fact in facts) or None
+                previous_question = None
+                previous_answer = None
 
             expert_result = await self.main_expert.answer(
                 repo,
@@ -318,6 +332,8 @@ class QuestionService:
                 conversation_history=conversation_history,
                 response_mode=response_mode,
                 request_id=request_id,
+                user_memory=user_memory,
+                conversation_summary=session.summary if is_private else None,
             )
             if expert_result is None or not expert_result.text.strip():
                 await self._fail_closed(bot, message, question.id, session.id, repo)
@@ -335,9 +351,7 @@ class QuestionService:
                 )
             await repo.update_session_last_bot_message(session.id, sent_message.message_id)
             if reserved_credits:
-                await self.credit_service.commit(
-                    repo, user_id, request_id, reserved_credits
-                )
+                await self.credit_service.commit(repo, user_id, request_id, reserved_credits)
                 await repo.set_question_credits_charged(question.id, reserved_credits)
                 credits_committed = True
             await repo.update_question_filter_result(
@@ -349,6 +363,15 @@ class QuestionService:
             )
             if relation:
                 await repo.update_question_context_relation(question.id, relation.relation)
+
+            if is_private:
+                updated_summary = self._updated_private_summary(
+                    session.summary,
+                    gate_result.question_text,
+                    expert_result.text,
+                )
+                await repo.update_session_summary(session.id, updated_summary)
+                await self._send_feedback_prompt(bot, message.chat.id, question.id)
 
             if self._should_store_cache(
                 is_private=is_private,
@@ -376,9 +399,7 @@ class QuestionService:
             )
         finally:
             if reserved_credits and not credits_committed:
-                await self.credit_service.release(
-                    repo, user_id, request_id, reserved_credits
-                )
+                await self.credit_service.release(repo, user_id, request_id, reserved_credits)
             self.gate.release_concurrent(user_id)
 
     def _cache_lookup_allowed(self, question_text: str) -> bool:
@@ -408,6 +429,26 @@ class QuestionService:
             f"{self.settings.knowledge_base_version}:"
             f"{self.settings.prompt_version}:{str(mode)}:{normalized}"
         )
+
+    def _updated_private_summary(self, current: str | None, question: str, answer: str) -> str:
+        entry = f"Пользователь: {question}\nАссистент: {answer}"
+        combined = f"{current}\n\n{entry}" if current else entry
+        return combined[-self.settings.private_memory_max_chars :]
+
+    @staticmethod
+    async def _send_feedback_prompt(bot: Bot, chat_id: int, question_id) -> None:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="👍", callback_data=f"feedback:up:{question_id}"),
+                    InlineKeyboardButton(text="👎", callback_data=f"feedback:down:{question_id}"),
+                ]
+            ]
+        )
+        try:
+            await bot.send_message(chat_id, "Оцените ответ:", reply_markup=keyboard)
+        except TelegramAPIError as exc:
+            logger.warning("feedback_prompt_failed", chat_id=chat_id, error=str(exc))
 
     async def _store_answer_cache(
         self,

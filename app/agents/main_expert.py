@@ -39,6 +39,8 @@ class MainExpertAgent:
         conversation_history: list[tuple[str, str]] | None = None,
         response_mode: ResponseMode | str = ResponseMode.QUICK,
         request_id: uuid.UUID | None = None,
+        user_memory: str | None = None,
+        conversation_summary: str | None = None,
     ) -> TimewebAgentResponse | None:
         parts = [self._prompt, f"Question:\n{question}"]
         if previous_question and previous_answer:
@@ -54,6 +56,15 @@ class MainExpertAgent:
                 for history_question, history_answer in conversation_history
             )
             parts.append(f"Recent private conversation:\n{history}")
+        if conversation_summary:
+            parts.append(f"Working conversation memory:\n{conversation_summary}")
+        if user_memory:
+            parts.append(
+                "User-confirmed profile facts:\n"
+                f"{user_memory}\n"
+                "If the current message conflicts with these facts, ask which value is current "
+                "instead of silently replacing a fact."
+            )
         if str(response_mode) == ResponseMode.DEEP:
             parts.append(
                 "Response mode: detailed. Explain the mechanism, steps, options, risks, "

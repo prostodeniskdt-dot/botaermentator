@@ -6,6 +6,8 @@ from aiogram.types import Update
 from fastapi import APIRouter, Header, HTTPException, Request, status
 
 from app.config import Settings, get_settings
+from app.db.repositories import Repository
+from app.db.session import session_scope
 from app.logging import get_logger
 
 logger = get_logger(__name__)
@@ -35,7 +37,18 @@ def create_webhook_router(settings: Settings | None = None) -> APIRouter:
 
         payload = await request.json()
         update_id = payload.get("update_id")
+        if not isinstance(update_id, int):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="missing update_id",
+            )
         logger.info("telegram_webhook_received", update_id=update_id)
+
+        if webhook_settings.durable_update_queue_enabled:
+            async with session_scope() as db:
+                queued = await Repository(db).enqueue_update_job(update_id, payload)
+            logger.info("telegram_webhook_queued", update_id=update_id, inserted=queued)
+            return {"ok": True}
 
         update = Update.model_validate(payload, context={"bot": bot})
         try:

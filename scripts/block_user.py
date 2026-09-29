@@ -8,6 +8,7 @@ import asyncio
 import sys
 
 from app.config import get_settings
+from app.db.repositories import Repository
 from app.db.session import session_scope
 from app.services.blocking_service import BlockingService
 
@@ -21,7 +22,7 @@ async def main() -> int:
     settings = get_settings()
     service = BlockingService(settings)
     async with session_scope() as db:
-        user = await service.block_user(db, args.telegram_user_id, reason=args.reason)
+        user = await service.block_user(Repository(db), args.telegram_user_id, reason=args.reason)
     if user is None:
         print("user_not_found", file=sys.stderr)
         return 1

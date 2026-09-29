@@ -147,5 +147,3 @@ def test_database_password_override(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.database_url == (
         "postgresql+asyncpg://gen_user:p%40ss%3Aword%2Fwith@host:5432/default_db"
     )
-
-

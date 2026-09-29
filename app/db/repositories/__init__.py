@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,7 +20,9 @@ from app.db.models.entities import (
     CreditTransaction,
     ProcessedUpdate,
     RateLimitCounter,
+    SystemSetting,
     TelegramUser,
+    TelegramUpdateJob,
     UserFeedback,
     UserQuestion,
 )
@@ -131,6 +133,37 @@ class Repository:
         user.response_mode = str(mode)
         await self.session.flush()
         return user
+
+    async def add_user_profile_fact(self, telegram_user_id: int, fact: str) -> TelegramUser | None:
+        user = await self.get_user_by_telegram_id(telegram_user_id)
+        if user is None:
+            return None
+        facts = list(user.profile_facts.get("confirmed", []))
+        if fact not in facts:
+            facts.append(fact)
+        user.profile_facts = {**user.profile_facts, "confirmed": facts}
+        await self.session.flush()
+        return user
+
+    async def record_access_request(self, telegram_user_id: int) -> bool:
+        existing = await self.session.execute(
+            select(AccessEvent.id).where(
+                AccessEvent.telegram_user_id == telegram_user_id,
+                AccessEvent.new_status == AccessStatus.PENDING,
+            )
+        )
+        if existing.scalar_one_or_none() is not None:
+            return False
+        self.session.add(
+            AccessEvent(
+                telegram_user_id=telegram_user_id,
+                old_status=None,
+                new_status=AccessStatus.PENDING,
+                reason="bot_started",
+            )
+        )
+        await self.session.flush()
+        return True
 
     async def clear_user_memory(self, telegram_user_id: int) -> None:
         user = await self.get_user_by_telegram_id(telegram_user_id)
@@ -270,6 +303,11 @@ class Repository:
         )
         await self.session.execute(stmt)
 
+    async def update_session_summary(self, session_id: uuid.UUID, summary: str) -> None:
+        await self.session.execute(
+            update(ChatSession).where(ChatSession.id == session_id).values(summary=summary)
+        )
+
     # --- Questions & responses ---
 
     async def create_question(
@@ -295,6 +333,12 @@ class Repository:
         self.session.add(question)
         await self.session.flush()
         return question
+
+    async def get_question(self, question_id: uuid.UUID) -> UserQuestion | None:
+        result = await self.session.execute(
+            select(UserQuestion).where(UserQuestion.id == question_id)
+        )
+        return result.scalar_one_or_none()
 
     async def set_question_credits_charged(self, question_id: uuid.UUID, amount: int) -> None:
         await self.session.execute(
@@ -484,6 +528,106 @@ class Repository:
         db_result = await self.session.execute(stmt)
         return db_result.scalar_one_or_none() is not None
 
+    # --- Durable Telegram update queue ---
+
+    async def enqueue_update_job(self, telegram_update_id: int, payload: dict) -> bool:
+        result = await self.session.execute(
+            insert(TelegramUpdateJob)
+            .values(
+                id=uuid.uuid4(),
+                telegram_update_id=telegram_update_id,
+                payload=payload,
+                status="pending",
+            )
+            .on_conflict_do_nothing(index_elements=["telegram_update_id"])
+            .returning(TelegramUpdateJob.id)
+        )
+        return result.scalar_one_or_none() is not None
+
+    async def claim_update_job(self, *, stale_after_seconds: int = 300) -> TelegramUpdateJob | None:
+        now = datetime.now(UTC)
+        stale_before = now - timedelta(seconds=stale_after_seconds)
+        result = await self.session.execute(
+            select(TelegramUpdateJob)
+            .where(
+                or_(
+                    (
+                        (TelegramUpdateJob.status == "pending")
+                        & (TelegramUpdateJob.available_at <= now)
+                    ),
+                    (
+                        (TelegramUpdateJob.status == "processing")
+                        & (TelegramUpdateJob.locked_at < stale_before)
+                    ),
+                )
+            )
+            .order_by(TelegramUpdateJob.created_at)
+            .with_for_update(skip_locked=True)
+            .limit(1)
+        )
+        job = result.scalar_one_or_none()
+        if job is not None:
+            job.status = "processing"
+            job.attempts += 1
+            job.locked_at = now
+            job.last_error = None
+            await self.session.flush()
+        return job
+
+    async def complete_update_job(self, job_id: uuid.UUID) -> None:
+        await self.session.execute(
+            update(TelegramUpdateJob)
+            .where(TelegramUpdateJob.id == job_id)
+            .values(status="done", locked_at=None, updated_at=func.now())
+        )
+
+    async def fail_update_job(
+        self,
+        job_id: uuid.UUID,
+        *,
+        error: str,
+        retry: bool,
+        retry_delay_seconds: int = 10,
+    ) -> None:
+        values = {
+            "status": "pending" if retry else "failed",
+            "locked_at": None,
+            "last_error": error[:2000],
+            "updated_at": func.now(),
+        }
+        if retry:
+            values["available_at"] = datetime.now(UTC) + timedelta(seconds=retry_delay_seconds)
+        await self.session.execute(
+            update(TelegramUpdateJob).where(TelegramUpdateJob.id == job_id).values(**values)
+        )
+
+    async def get_system_setting(self, key: str, default=None):
+        result = await self.session.execute(
+            select(SystemSetting.value).where(SystemSetting.key == key)
+        )
+        value = result.scalar_one_or_none()
+        return default if value is None else value.get("value", default)
+
+    async def set_system_setting(
+        self, key: str, value, *, admin_telegram_user_id: int | None = None
+    ) -> None:
+        await self.session.execute(
+            insert(SystemSetting)
+            .values(
+                key=key,
+                value={"value": value},
+                updated_by=admin_telegram_user_id,
+            )
+            .on_conflict_do_update(
+                index_elements=["key"],
+                set_={
+                    "value": {"value": value},
+                    "updated_by": admin_telegram_user_id,
+                    "updated_at": func.now(),
+                },
+            )
+        )
+
     # --- Usage ---
 
     async def record_usage_event(self, event: AIUsageEvent) -> AIUsageEvent:
@@ -554,6 +698,18 @@ class Repository:
         )
         await self.session.flush()
         return account
+
+    async def has_credit_grant_reason(self, telegram_user_id: int, reason: str) -> bool:
+        result = await self.session.execute(
+            select(CreditTransaction.id)
+            .where(
+                CreditTransaction.telegram_user_id == telegram_user_id,
+                CreditTransaction.transaction_type == CreditTransactionType.GRANT,
+                CreditTransaction.reason == reason,
+            )
+            .limit(1)
+        )
+        return result.scalar_one_or_none() is not None
 
     async def reserve_credits(
         self, telegram_user_id: int, request_id: uuid.UUID, amount: int
@@ -734,6 +890,13 @@ class Repository:
         )
         result = await self.session.execute(stmt)
         return int(result.scalar_one())
+
+    async def try_acquire_user_processing_lock(self, telegram_user_id: int) -> bool:
+        result = await self.session.execute(
+            text("SELECT pg_try_advisory_xact_lock(:lock_id)"),
+            {"lock_id": telegram_user_id},
+        )
+        return bool(result.scalar_one())
 
     async def get_rate_limit_count(
         self,

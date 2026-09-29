@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import uuid
+
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -80,7 +82,8 @@ async def private_quick(message: Message, settings, bot, access_service) -> None
         return
     async with session_scope() as db:
         await Repository(db).set_user_response_mode(
-            message.from_user.id, ResponseMode.QUICK  # type: ignore[union-attr]
+            message.from_user.id,
+            ResponseMode.QUICK,  # type: ignore[union-attr]
         )
     await message.answer(MODE_QUICK.format(credits=settings.quick_mode_credits))
 
@@ -91,7 +94,8 @@ async def private_deep(message: Message, settings, bot, access_service) -> None:
         return
     async with session_scope() as db:
         await Repository(db).set_user_response_mode(
-            message.from_user.id, ResponseMode.DEEP  # type: ignore[union-attr]
+            message.from_user.id,
+            ResponseMode.DEEP,  # type: ignore[union-attr]
         )
     await message.answer(MODE_DEEP.format(credits=settings.deep_mode_credits))
 
@@ -123,6 +127,34 @@ async def private_balance(message: Message, settings, bot, access_service) -> No
 async def private_privacy(message: Message, settings, bot, access_service) -> None:
     if await _active_user(message, settings, bot, access_service):
         await message.answer(PRIVACY)
+
+
+@router.message(F.chat.type == "private", Command("remember"))
+async def private_remember(message: Message, settings, bot, access_service) -> None:
+    if not await _active_user(message, settings, bot, access_service):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].strip():
+        await message.answer("Использование: /remember <факт, который нужно запомнить>")
+        return
+    async with session_scope() as db:
+        await Repository(db).add_user_profile_fact(
+            message.from_user.id,
+            parts[1].strip(),  # type: ignore[union-attr]
+        )
+    await message.answer("Факт сохранён в подтверждённом профиле.")
+
+
+@router.message(F.chat.type == "private", Command("profile"))
+async def private_profile(message: Message, settings, bot, access_service) -> None:
+    user = await _active_user(message, settings, bot, access_service)
+    if user is None:
+        return
+    facts = user.profile_facts.get("confirmed", [])
+    if not facts:
+        await message.answer("Подтверждённых фактов пока нет. Добавьте их через /remember.")
+        return
+    await message.answer("Подтверждённые сведения:\n" + "\n".join(f"• {fact}" for fact in facts))
 
 
 @router.message(F.chat.type == "private", Command("forget"))
@@ -163,6 +195,30 @@ async def cancel_forget(callback: CallbackQuery) -> None:
     await callback.answer()
     if callback.message:
         await callback.message.edit_text("Удаление отменено.")
+
+
+@router.callback_query(F.data.startswith("feedback:"))
+async def save_feedback(callback: CallbackQuery) -> None:
+    if callback.from_user is None or callback.data is None:
+        return
+    _, rating_value, question_value = callback.data.split(":", maxsplit=2)
+    try:
+        question_id = uuid.UUID(question_value)
+    except ValueError:
+        await callback.answer("Некорректная оценка", show_alert=True)
+        return
+    rating = 1 if rating_value == "up" else -1
+    async with session_scope() as db:
+        repo = Repository(db)
+        question = await repo.get_question(question_id)
+        session = await repo.get_session(question.session_id) if question else None
+        if session is None or session.telegram_user_id != callback.from_user.id:
+            await callback.answer("Ответ не найден", show_alert=True)
+            return
+        await repo.add_feedback(callback.from_user.id, question_id, rating)
+    await callback.answer("Спасибо за оценку!")
+    if callback.message:
+        await callback.message.edit_text("Спасибо за оценку!")
 
 
 def _parse_mode_prefix(text: str, default_mode: str) -> tuple[ResponseMode, str]:
