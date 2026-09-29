@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from functools import partial
 
 from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject, Update
@@ -20,6 +22,7 @@ from app.bot.factory import build_services, create_bot, create_dispatcher
 from app.config import clear_settings_cache, get_settings
 from app.db.session import check_database_connection, get_engine, reset_engine
 from app.logging import configure_logging, get_logger
+from app.services.update_queue import UpdateQueueWorker
 
 
 class UpdateContextMiddleware(BaseMiddleware):
@@ -47,10 +50,14 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
 
     missing = settings.missing_critical_settings()
     if settings.is_production and missing:
-        logger.warning("production_missing_settings", missing=missing)
+        logger.error("production_missing_settings", missing=missing)
+        raise RuntimeError(f"Missing critical production settings: {', '.join(missing)}")
 
     bot = None
     dispatcher = None
+    question_service = None
+    update_worker = None
+    update_worker_task = None
     timeweb_client = TimewebClient(settings)
 
     if settings.telegram_bot_token:
@@ -122,9 +129,30 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         else:
             logger.error("database_connection_failed")
 
+    if (
+        settings.durable_update_queue_enabled
+        and settings.database_url
+        and bot is not None
+        and dispatcher is not None
+        and question_service is not None
+    ):
+        update_worker = UpdateQueueWorker(
+            bot,
+            dispatcher,
+            poll_interval_seconds=settings.update_queue_poll_seconds,
+            max_attempts=settings.update_queue_max_attempts,
+            stale_after_seconds=settings.update_queue_stale_seconds,
+            heartbeat_seconds=settings.update_queue_heartbeat_seconds,
+            delivery_handler=partial(question_service.deliver_job, bot),
+        )
+        update_worker_task = asyncio.create_task(update_worker.run(), name="telegram-update-queue")
+
     try:
         yield
     finally:
+        if update_worker is not None and update_worker_task is not None:
+            update_worker.stop()
+            await update_worker_task
         await timeweb_client.aclose()
         if bot is not None:
             await bot.session.close()
@@ -137,7 +165,7 @@ async def _register_webhook(bot, settings, logger) -> None:
     await bot.set_webhook(
         url=settings.telegram_webhook_url,
         secret_token=settings.telegram_webhook_secret,
-        allowed_updates=["message", "my_chat_member"],
+        allowed_updates=["message", "callback_query", "my_chat_member"],
         drop_pending_updates=False,
     )
     logger.info("telegram_webhook_registered", url=settings.telegram_webhook_url)

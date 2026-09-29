@@ -11,6 +11,7 @@ from app.bot.routers.group_questions import router as group_questions_router
 from app.bot.routers.membership import router as membership_router
 from app.bot.routers.private_messages import router as private_messages_router
 from app.config import Settings
+from app.services.access_service import AccessService
 from app.services.blocking_service import BlockingService
 from app.services.question_service import QuestionService
 from app.services.rate_limit_service import RateLimitService
@@ -35,10 +36,12 @@ def create_dispatcher(
     dp["settings"] = settings
     dp["question_service"] = question_service
     dp["blocking_service"] = blocking_service
+    dp["access_service"] = AccessService(settings)
     dp["bot"] = None  # injected at runtime via webhook feed_update
     dp.include_router(membership_router)
     dp.include_router(admin_router)
-    dp.include_router(private_messages_router)
+    if settings.private_access_enabled:
+        dp.include_router(private_messages_router)
     dp.include_router(group_questions_router)
     return dp
 

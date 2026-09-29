@@ -2,7 +2,9 @@
 
 ## Purpose
 
-Closed-group Telegram bot that answers hospitality/fermentation questions using three Timeweb Cloud AI agents and an author knowledge base. Membership in one paid group is the access control; payments are out of scope.
+Allow-listed private and closed-group Telegram bot that answers hospitality/fermentation
+questions using three Timeweb Cloud AI agents and an author knowledge base. Private access is
+approved manually by administrators. Payments are out of scope.
 
 ## High-level flow
 
@@ -12,6 +14,9 @@ Telegram update
       v
 FastAPI POST /telegram/webhook
   - X-Telegram-Bot-Api-Secret-Token
+      |
+      v
+PostgreSQL update queue
       |
       v
 aiogram dispatcher
@@ -41,7 +46,10 @@ Question orchestrator
       +--> Agent 3 Main Expert (KB + web search)
       |
       v
-Safe HTML formatter + split (~3800 chars)
+Transactional answer-delivery outbox
+      |
+      v
+Rich Markdown / safe HTML formatter + split
       |
       v
 Telegram reply (same chat / topic)
@@ -85,13 +93,17 @@ Shared `TimewebClient` → `POST /api/v1/cloud-ai/agents/{id}/call` with timeout
 | 2 Context Relation | Reply continuity | No | No | Standalone fallback |
 | 3 Main Expert | Final answer | Yes | Yes (panel) | Static error |
 
-App-managed context only: current question ± previous Q/A after Agent 2. No `parent_message_id` for user history in MVP.
+App-managed context: group replies use the previous Q/A after Agent 2. Private conversations
+use a bounded working summary, recent turns, and explicit confirmed profile facts.
 
 ### Persistence (`app/db`)
 
 PostgreSQL via SQLAlchemy 2 + asyncpg. Schema changes only through Alembic.
 
-Key tables: `telegram_users`, `chat_sessions`, `user_questions`, `bot_responses`, `processed_updates`, `ai_usage_events`, `rate_limit_counters`, `block_events`.
+Key tables: `telegram_users`, `chat_sessions`, `user_questions`, `bot_responses`,
+`processed_updates`, `ai_usage_events`, `rate_limit_counters`, `block_events`,
+`credit_accounts`, `credit_transactions`, `access_events`, `user_feedback`,
+`telegram_update_jobs`, `telegram_delivery_jobs`, `system_settings`.
 
 Telegram IDs stored as `BIGINT`. Persist text only for explicit bot invocations.
 
@@ -106,7 +118,11 @@ Telegram IDs stored as `BIGINT`. Persist text only for explicit bot invocations.
 
 - One `ALLOWED_CHAT_ID`.
 - Wrong group: on `my_chat_member` join → `leaveChat`, no AI.
-- Private chat: static refusal unless `ADMIN_USER_IDS`.
+- Private chat: `/start` creates one pending access request.
+- Administrators approve by immutable Telegram user ID.
+- Pending/rejected/blocked users cannot call AI.
+- Approved users receive a one-time configurable starting credit grant.
+- Internal credits are reserved before processing and committed only for a successful answer.
 - Paid membership managed externally (e.g. Tribute); bot does not integrate payments.
 
 ## Deployment shape

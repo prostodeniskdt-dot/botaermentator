@@ -5,9 +5,7 @@ PORT="${PORT:-${APP_PORT:-8080}}"
 
 if [ -n "${DATABASE_URL:-}" ]; then
   echo "start.sh: running alembic upgrade head"
-  if ! alembic upgrade head; then
-    echo "start.sh: WARNING: alembic migration failed — starting app anyway"
-  fi
+  alembic upgrade head
 fi
 
 echo "start.sh: launching uvicorn on 0.0.0.0:${PORT} (module app.main:app)"

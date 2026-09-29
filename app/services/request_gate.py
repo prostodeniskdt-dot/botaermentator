@@ -74,6 +74,7 @@ class RequestGate:
         bot_username: str,
         bot_id: int,
         reply_session_id: object | None = None,
+        enforce_allowed_chat: bool = True,
     ) -> GateResult:
         if message.from_user is None or message.from_user.is_bot:
             return GateResult(outcome=GateOutcome.REJECT, user_message=EMPTY_QUESTION)
@@ -82,7 +83,8 @@ class RequestGate:
             return GateResult(outcome=GateOutcome.DUPLICATE_UPDATE)
 
         if (
-            self.settings.allowed_chat_id is not None
+            enforce_allowed_chat
+            and self.settings.allowed_chat_id is not None
             and message.chat.id != self.settings.allowed_chat_id
         ):
             return GateResult(outcome=GateOutcome.REJECT)
@@ -98,10 +100,13 @@ class RequestGate:
 
         if reply_session_id is not None:
             session = await repo.get_session(reply_session_id)
-            if session is not None and session.status == "blocked":
+            if session is not None and session.status in {"paused", "blocked"}:
                 return GateResult(outcome=GateOutcome.REJECT, user_message=SESSION_BLOCKED)
 
-        if not self.settings.ai_processing_enabled:
+        ai_processing_enabled = await repo.get_system_setting(
+            "ai_processing_enabled", self.settings.ai_processing_enabled
+        )
+        if not ai_processing_enabled:
             return GateResult(outcome=GateOutcome.REJECT, user_message=AI_DISABLED)
 
         if await self.usage_service.is_budget_exceeded(repo):
@@ -124,6 +129,11 @@ class RequestGate:
             return GateResult(outcome=GateOutcome.REJECT, user_message=RATE_LIMIT)
 
         if self._is_concurrent(message.from_user.id):
+            return GateResult(outcome=GateOutcome.REJECT, user_message=CONCURRENT_REQUEST)
+        if (
+            self.settings.max_concurrent_requests_per_user == 1
+            and not await repo.try_acquire_user_processing_lock(message.from_user.id)
+        ):
             return GateResult(outcome=GateOutcome.REJECT, user_message=CONCURRENT_REQUEST)
 
         normalized = " ".join(question_text.lower().split())

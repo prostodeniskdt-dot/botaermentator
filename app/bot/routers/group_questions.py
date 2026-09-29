@@ -24,6 +24,11 @@ async def on_group_message(
 ) -> None:
     if message.chat.type not in {"group", "supergroup"}:
         return
+    if (
+        question_service.gate.detect_address(message, bot_username=bot_username, bot_id=bot_id)
+        is None
+    ):
+        return
 
     async with session_scope() as db:
         repo = Repository(db)

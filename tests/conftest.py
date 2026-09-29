@@ -54,4 +54,6 @@ def mock_repo() -> AsyncMock:
     repo.has_duplicate_question.return_value = False
     repo.get_daily_usage_cost.return_value = 0.0
     repo.increment_rate_limit.return_value = 1
+    repo.get_system_setting.side_effect = lambda _key, default=None: default
+    repo.try_acquire_user_processing_lock.return_value = True
     return repo

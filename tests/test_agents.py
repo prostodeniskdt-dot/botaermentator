@@ -160,9 +160,9 @@ async def test_agent2_timeout_fallback(settings: Settings, timeweb_base: str, mo
     respx.post(
         "https://agent.timeweb.cloud/api/v1/cloud-ai/agents/agent2/v1/chat/completions"
     ).mock(side_effect=httpx.TimeoutException("timeout"))
-    respx.post(
-        "https://agent.timeweb.cloud/api/v1/cloud-ai/agents/agent2/v1/responses"
-    ).mock(side_effect=httpx.TimeoutException("timeout"))
+    respx.post("https://agent.timeweb.cloud/api/v1/cloud-ai/agents/agent2/v1/responses").mock(
+        side_effect=httpx.TimeoutException("timeout")
+    )
     client = TimewebClient(settings)
     agent = ContextRelationAgent(settings, client)
     result = await agent.evaluate(
@@ -208,9 +208,9 @@ async def test_agent3_http_500(settings: Settings, timeweb_base: str, mock_repo:
     respx.post(
         "https://agent.timeweb.cloud/api/v1/cloud-ai/agents/agent3/v1/chat/completions"
     ).mock(return_value=httpx.Response(500, json={"error": "fail"}))
-    respx.post(
-        "https://agent.timeweb.cloud/api/v1/cloud-ai/agents/agent3/v1/responses"
-    ).mock(return_value=httpx.Response(500, json={"error": "fail"}))
+    respx.post("https://agent.timeweb.cloud/api/v1/cloud-ai/agents/agent3/v1/responses").mock(
+        return_value=httpx.Response(500, json={"error": "fail"})
+    )
     client = TimewebClient(settings)
     agent = MainExpertAgent(settings, client)
     result = await agent.answer(
@@ -225,9 +225,7 @@ async def test_agent3_http_500(settings: Settings, timeweb_base: str, mock_repo:
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_timeweb_client_402_stops_without_fallback(
-    settings: Settings, timeweb_base: str
-):
+async def test_timeweb_client_402_stops_without_fallback(settings: Settings, timeweb_base: str):
     native = respx.post(f"{timeweb_base}/api/v1/cloud-ai/agents/agent3/call").mock(
         return_value=httpx.Response(
             402,
@@ -257,15 +255,13 @@ async def test_timeweb_client_402_stops_without_fallback(
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_timeweb_client_4xx_tries_fallback_then_raises(
-    settings: Settings, timeweb_base: str
-):
+async def test_timeweb_client_4xx_tries_fallback_then_raises(settings: Settings, timeweb_base: str):
     native = respx.post(f"{timeweb_base}/api/v1/cloud-ai/agents/agent1/call").mock(
         return_value=httpx.Response(400, json={"error": "bad"})
     )
-    native_alt = respx.post(
-        "https://agent.timeweb.cloud/api/v1/cloud-ai/agents/agent1/call"
-    ).mock(return_value=httpx.Response(400, json={"error": "bad"}))
+    native_alt = respx.post("https://agent.timeweb.cloud/api/v1/cloud-ai/agents/agent1/call").mock(
+        return_value=httpx.Response(400, json={"error": "bad"})
+    )
     openai_compat = respx.post(
         "https://agent.timeweb.cloud/api/v1/cloud-ai/agents/agent1/v1/chat/completions"
     ).mock(return_value=httpx.Response(400, json={"error": "bad"}))
@@ -284,9 +280,7 @@ async def test_timeweb_client_4xx_tries_fallback_then_raises(
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_timeweb_client_openai_compat_fallback(
-    settings: Settings, timeweb_base: str
-):
+async def test_timeweb_client_openai_compat_fallback(settings: Settings, timeweb_base: str):
     respx.post(f"{timeweb_base}/api/v1/cloud-ai/agents/agent3/call").mock(
         return_value=httpx.Response(400, json={"error": "bad"})
     )
@@ -322,9 +316,7 @@ async def test_timeweb_client_responses_fallback(settings: Settings, timeweb_bas
     respx.post(
         "https://agent.timeweb.cloud/api/v1/cloud-ai/agents/agent3/v1/chat/completions"
     ).mock(return_value=httpx.Response(400, json={"error": "bad"}))
-    respx.post(
-        "https://agent.timeweb.cloud/api/v1/cloud-ai/agents/agent3/v1/responses"
-    ).mock(
+    respx.post("https://agent.timeweb.cloud/api/v1/cloud-ai/agents/agent3/v1/responses").mock(
         return_value=httpx.Response(
             200,
             json={
@@ -336,4 +328,23 @@ async def test_timeweb_client_responses_fallback(settings: Settings, timeweb_bas
     client = TimewebClient(settings)
     result = await client.call_agent(agent_id="agent3", token="t3", message="Вопрос")
     assert result.message == "Ответ через responses API"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_timeweb_client_sends_native_output_limit(settings: Settings, timeweb_base: str):
+    route = respx.post(f"{timeweb_base}/api/v1/cloud-ai/agents/agent3/call").mock(
+        return_value=httpx.Response(200, json={"message": "Краткий ответ"})
+    )
+    client = TimewebClient(settings)
+
+    await client.call_agent(
+        agent_id="agent3",
+        token="t3",
+        message="Вопрос",
+        max_output_tokens=600,
+    )
+
+    assert json.loads(route.calls[0].request.content)["max_tokens"] == 600
     await client.aclose()

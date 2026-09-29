@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from urllib.parse import urlparse
 
@@ -49,6 +49,8 @@ class TimewebCallResult:
     output_tokens: int | None = None
     actual_cost_rub: float | None = None
     used_web_search: bool = False
+    transport: str | None = None
+    attempt_number: int = 1
 
 
 class TimewebClient:
@@ -73,6 +75,7 @@ class TimewebClient:
         agent_id: str,
         token: str,
         message: str,
+        max_output_tokens: int | None = None,
     ) -> TimewebCallResult:
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         attempts = max(1, self.settings.timeweb_max_attempts)
@@ -81,7 +84,7 @@ class TimewebClient:
         retryable_failure = False
         for attempt in range(1, attempts + 1):
             retryable_failure = False
-            for mode, url, payload in self._request_variants(agent_id, message):
+            for mode, url, payload in self._request_variants(agent_id, message, max_output_tokens):
                 started = time.perf_counter()
                 try:
                     result = await self._post_once(url, headers, payload, started)
@@ -91,7 +94,7 @@ class TimewebClient:
                             agent_id=agent_id,
                             mode=mode,
                         )
-                    return result
+                    return replace(result, transport=mode, attempt_number=attempt)
                 except TimewebTimeoutError as exc:
                     last_error = exc
                     retryable_failure = True
@@ -140,11 +143,14 @@ class TimewebClient:
         raise last_error
 
     def _request_variants(
-        self, agent_id: str, message: str
+        self, agent_id: str, message: str, max_output_tokens: int | None = None
     ) -> list[tuple[str, str, dict[str, Any]]]:
         variants: list[tuple[str, str, dict[str, Any]]] = []
         for url in self._native_urls(agent_id):
-            variants.append(("native", url, {"message": message}))
+            payload: dict[str, Any] = {"message": message}
+            if max_output_tokens is not None:
+                payload["max_tokens"] = max_output_tokens
+            variants.append(("native", url, payload))
 
         # gpt-5.x + tools rejects default reasoning_effort on chat/completions.
         # Do not send model name: Timeweb uses the agent panel model; a wrong id
@@ -157,6 +163,11 @@ class TimewebClient:
                     "messages": [{"role": "user", "content": message}],
                     "stream": False,
                     "reasoning_effort": "none",
+                    **(
+                        {"max_completion_tokens": max_output_tokens}
+                        if max_output_tokens is not None
+                        else {}
+                    ),
                 },
             )
         )
@@ -167,6 +178,11 @@ class TimewebClient:
                 {
                     "input": message,
                     "reasoning": {"effort": "none"},
+                    **(
+                        {"max_output_tokens": max_output_tokens}
+                        if max_output_tokens is not None
+                        else {}
+                    ),
                 },
             )
         )
@@ -174,7 +190,14 @@ class TimewebClient:
             (
                 "responses_plain",
                 self._openai_compat_url(agent_id, "responses"),
-                {"input": message},
+                {
+                    "input": message,
+                    **(
+                        {"max_output_tokens": max_output_tokens}
+                        if max_output_tokens is not None
+                        else {}
+                    ),
+                },
             )
         )
         return variants

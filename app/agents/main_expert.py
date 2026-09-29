@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -10,7 +11,7 @@ from app.agents.timeweb_client import TimewebClient, TimewebClientError
 from app.config import Settings
 from app.db.models.entities import AIUsageEvent
 from app.db.repositories import Repository
-from app.domain.enums import AgentType
+from app.domain.enums import AgentType, ResponseMode
 from app.logging import get_logger
 
 logger = get_logger(__name__)
@@ -35,6 +36,11 @@ class MainExpertAgent:
         question_id,
         previous_question: str | None = None,
         previous_answer: str | None = None,
+        conversation_history: list[tuple[str, str]] | None = None,
+        response_mode: ResponseMode | str = ResponseMode.QUICK,
+        request_id: uuid.UUID | None = None,
+        user_memory: str | None = None,
+        conversation_summary: str | None = None,
     ) -> TimewebAgentResponse | None:
         parts = [self._prompt, f"Question:\n{question}"]
         if previous_question and previous_answer:
@@ -44,6 +50,33 @@ class MainExpertAgent:
                     f"Previous answer:\n{previous_answer}",
                 ]
             )
+        if conversation_history:
+            history = "\n\n".join(
+                f"User: {history_question}\nAssistant: {history_answer}"
+                for history_question, history_answer in conversation_history
+            )
+            parts.append(f"Recent private conversation:\n{history}")
+        if conversation_summary:
+            parts.append(f"Working conversation memory:\n{conversation_summary}")
+        if user_memory:
+            parts.append(
+                "User-confirmed profile facts:\n"
+                f"{user_memory}\n"
+                "If the current message conflicts with these facts, ask which value is current "
+                "instead of silently replacing a fact."
+            )
+        if str(response_mode) == ResponseMode.DEEP:
+            parts.append(
+                "Response mode: detailed. Explain the mechanism, steps, options, risks, "
+                "and practical limitations. Stay within the output budget."
+            )
+            max_output_tokens = self.settings.deep_max_output_tokens
+        else:
+            parts.append(
+                "Response mode: concise. Give a direct answer, required actions, and critical "
+                "warnings. Stay within the output budget."
+            )
+            max_output_tokens = self.settings.quick_max_output_tokens
         message = "\n\n".join(part for part in parts if part)
 
         started = datetime.now(UTC)
@@ -52,6 +85,7 @@ class MainExpertAgent:
                 agent_id=self.settings.timeweb_agent_3_id,
                 token=self.settings.timeweb_agent_3_token,
                 message=message,
+                max_output_tokens=max_output_tokens,
             )
             estimated = self.settings.agent_3_estimated_cost_rub
             if call.used_web_search:
@@ -64,6 +98,8 @@ class MainExpertAgent:
                 call,
                 success=True,
                 estimated_cost=estimated,
+                request_id=request_id,
+                response_mode=str(response_mode),
             )
             if not call.message.strip():
                 return None
@@ -85,6 +121,8 @@ class MainExpertAgent:
                 None,
                 success=False,
                 error_code=getattr(exc, "error_code", "client_error"),
+                request_id=request_id,
+                response_mode=str(response_mode),
             )
             logger.error(
                 "agent3_failed",
@@ -105,12 +143,15 @@ class MainExpertAgent:
         success: bool,
         estimated_cost: float | None = None,
         error_code: str | None = None,
+        request_id: uuid.UUID | None = None,
+        response_mode: str | None = None,
     ) -> None:
         finished = datetime.now(UTC)
         latency = int((finished - started).total_seconds() * 1000)
         event = AIUsageEvent(
             session_id=session_id,
             question_id=question_id,
+            request_id=request_id,
             agent_type=AgentType.MAIN_EXPERT,
             agent_id=self.settings.timeweb_agent_3_id,
             response_id=getattr(call, "response_id", None),
@@ -123,6 +164,9 @@ class MainExpertAgent:
             output_tokens=getattr(call, "output_tokens", None),
             actual_cost_rub=getattr(call, "actual_cost_rub", None),
             estimated_cost_rub=estimated_cost or self.settings.agent_3_estimated_cost_rub,
+            response_mode=response_mode,
+            transport=getattr(call, "transport", None),
+            attempt_number=getattr(call, "attempt_number", 1),
             error_code=error_code,
         )
         await repo.record_usage_event(event)

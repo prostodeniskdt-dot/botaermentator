@@ -9,6 +9,7 @@ import sys
 import uuid
 
 from app.config import get_settings
+from app.db.repositories import Repository
 from app.db.session import session_scope
 from app.services.blocking_service import BlockingService
 
@@ -21,7 +22,7 @@ async def main() -> int:
     settings = get_settings()
     service = BlockingService(settings)
     async with session_scope() as db:
-        session = await service.unblock_session(db, args.session_id)
+        session = await service.unblock_session(Repository(db), args.session_id)
     if session is None:
         print("session_not_found", file=sys.stderr)
         return 1

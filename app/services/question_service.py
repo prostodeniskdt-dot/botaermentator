@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+import uuid
+
 from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
-from aiogram.types import InputRichMessage, Message, ReplyParameters
+from aiogram.types import (
+    Chat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputRichMessage,
+    Message,
+    ReplyParameters,
+)
 
 from app.agents.context_relation import ContextRelationAgent
 from app.agents.industry_filter import IndustryFilterAgent
@@ -16,11 +25,12 @@ from app.bot.mention import AddressKind
 from app.config import Settings
 from app.db.models.entities import AnswerCache
 from app.db.repositories import Repository
-from app.domain.enums import ContextRelation, QuestionStatus
-from app.domain.messages import AGENT_ERROR, OFF_TOPIC
+from app.domain.enums import ContextRelation, QuestionStatus, ResponseMode
+from app.domain.messages import AGENT_ERROR, INSUFFICIENT_CREDITS, OFF_TOPIC
 from app.logging import get_logger
 from app.services.answer_cache import normalize_question_key
 from app.services.blocking_service import BlockingService
+from app.services.credit_service import CreditService
 from app.services.request_gate import GateOutcome, RequestGate
 from app.services.session_service import SessionService
 
@@ -39,6 +49,7 @@ class QuestionService:
         industry_filter: IndustryFilterAgent,
         context_relation: ContextRelationAgent,
         main_expert: MainExpertAgent,
+        credit_service: CreditService | None = None,
     ) -> None:
         self.settings = settings
         self.gate = gate
@@ -47,6 +58,7 @@ class QuestionService:
         self.industry_filter = industry_filter
         self.context_relation = context_relation
         self.main_expert = main_expert
+        self.credit_service = credit_service or CreditService(settings)
 
     async def handle_group_message(
         self,
@@ -61,9 +73,59 @@ class QuestionService:
         address = self.gate.detect_address(message, bot_username=bot_username, bot_id=bot_id)
         if address is None:
             return
+        await self._handle_message(
+            repo,
+            bot,
+            message,
+            address=address,
+            update_id=update_id,
+            bot_username=bot_username,
+            bot_id=bot_id,
+            is_private=False,
+            response_mode=ResponseMode.QUICK,
+        )
 
+    async def handle_private_message(
+        self,
+        repo: Repository,
+        bot: Bot,
+        message: Message,
+        *,
+        update_id: int,
+        bot_username: str,
+        bot_id: int,
+        response_mode: ResponseMode,
+        question_text: str,
+    ) -> None:
+        from app.bot.mention import AddressInfo
+
+        await self._handle_message(
+            repo,
+            bot,
+            message,
+            address=AddressInfo(kind=AddressKind.ASK_COMMAND, question_text=question_text),
+            update_id=update_id,
+            bot_username=bot_username,
+            bot_id=bot_id,
+            is_private=True,
+            response_mode=response_mode,
+        )
+
+    async def _handle_message(
+        self,
+        repo: Repository,
+        bot: Bot,
+        message: Message,
+        *,
+        address,
+        update_id: int,
+        bot_username: str,
+        bot_id: int,
+        is_private: bool,
+        response_mode: ResponseMode,
+    ) -> None:
         reply_session_id = None
-        if address.kind == AddressKind.REPLY_TO_BOT and message.reply_to_message:
+        if not is_private and address.kind == AddressKind.REPLY_TO_BOT and message.reply_to_message:
             bot_response = await repo.find_bot_response_by_message(
                 message.chat.id,
                 message.reply_to_message.message_id,
@@ -79,6 +141,7 @@ class QuestionService:
             bot_username=bot_username,
             bot_id=bot_id,
             reply_session_id=reply_session_id,
+            enforce_allowed_chat=not is_private,
         )
 
         if gate_result.outcome == GateOutcome.DUPLICATE_UPDATE:
@@ -91,12 +154,31 @@ class QuestionService:
             return
 
         user_id = message.from_user.id  # type: ignore[union-attr]
+        request_id = uuid.uuid4()
+        reserved_credits = 0
+        credits_committed = False
+        durable_delivery = (
+            self.settings.durable_update_queue_enabled and self.settings.store_bot_responses
+        )
         try:
             await bot.send_chat_action(message.chat.id, "typing")
 
+            if is_private:
+                reserved = await self.credit_service.reserve(
+                    repo, user_id, request_id, response_mode
+                )
+                if reserved is None:
+                    await self._reply_text(bot, message, INSUFFICIENT_CREDITS)
+                    return
+                reserved_credits = reserved
+
             # Standalone questions (not reply to bot): serve from cache before any agents.
-            if reply_session_id is None and self._cache_lookup_allowed(gate_result.question_text):
-                cache_key = normalize_question_key(gate_result.question_text)
+            if (
+                not is_private
+                and reply_session_id is None
+                and self._cache_lookup_allowed(gate_result.question_text)
+            ):
+                cache_key = self._cache_key(gate_result.question_text, response_mode)
                 cached = await repo.get_cached_answer(cache_key)
                 if cached is not None:
                     await self._serve_cached_answer(
@@ -111,16 +193,25 @@ class QuestionService:
                     )
                     return
 
-            session, relation = await self.session_service.resolve_reply_session(
-                repo,
-                message,
-                bot_id=bot_id,
-                context_agent=self.context_relation,
-            )
+            if is_private:
+                session, relation = await self.session_service.resolve_private_session(
+                    repo, message, context_agent=self.context_relation
+                )
+            else:
+                session, relation = await self.session_service.resolve_reply_session(
+                    repo,
+                    message,
+                    bot_id=bot_id,
+                    context_agent=self.context_relation,
+                )
 
             contextual = bool(relation and relation.include_previous_context)
-            if not contextual and self._cache_lookup_allowed(gate_result.question_text):
-                cache_key = normalize_question_key(gate_result.question_text)
+            if (
+                not is_private
+                and not contextual
+                and self._cache_lookup_allowed(gate_result.question_text)
+            ):
+                cache_key = self._cache_key(gate_result.question_text, response_mode)
                 cached = await repo.get_cached_answer(cache_key)
                 if cached is not None:
                     await self._serve_cached_answer(
@@ -145,11 +236,18 @@ class QuestionService:
                 reply_to_message_id=(
                     message.reply_to_message.message_id if message.reply_to_message else None
                 ),
+                request_id=request_id,
+                response_mode=response_mode,
             )
 
+            filter_question = (
+                relation.rewritten_question
+                if relation and relation.rewritten_question
+                else gate_result.question_text
+            )
             filter_result = await self.industry_filter.evaluate(
                 repo,
-                question=gate_result.question_text,
+                question=filter_question,
                 session_id=session.id,
                 question_id=question.id,
             )
@@ -210,6 +308,24 @@ class QuestionService:
                 else normalized
             )
 
+            conversation_history: list[tuple[str, str]] = []
+            user_memory: str | None = None
+            if is_private:
+                if not session.summary:
+                    history_rows = await repo.get_recent_qa_for_session(
+                        session.id, limit=self.settings.private_context_turns
+                    )
+                    conversation_history = [
+                        (row_question.raw_question, row_answer.response_text)
+                        for row_question, row_answer in history_rows
+                    ]
+                user = await repo.get_user_by_telegram_id(user_id)
+                if user is not None:
+                    facts = user.profile_facts.get("confirmed", [])
+                    user_memory = "\n".join(f"- {fact}" for fact in facts) or None
+                previous_question = None
+                previous_answer = None
+
             expert_result = await self.main_expert.answer(
                 repo,
                 question=expert_question,
@@ -217,22 +333,38 @@ class QuestionService:
                 question_id=question.id,
                 previous_question=previous_question,
                 previous_answer=previous_answer,
+                conversation_history=conversation_history,
+                response_mode=response_mode,
+                request_id=request_id,
+                user_memory=user_memory,
+                conversation_summary=session.summary if is_private else None,
             )
             if expert_result is None or not expert_result.text.strip():
                 await self._fail_closed(bot, message, question.id, session.id, repo)
                 return
 
-            sent_message = await self._send_answer_parts(bot, message, expert_result.text)
-
+            bot_response = None
             if self.settings.store_bot_responses:
-                await repo.create_bot_response(
+                bot_response = await repo.create_bot_response(
                     session_id=session.id,
                     question_id=question.id,
                     response_text=expert_result.text,
-                    telegram_message_id=sent_message.message_id,
                     timeweb_response_id=expert_result.response_id,
+                    status=("delivery_pending" if durable_delivery else "sent"),
                 )
-            await repo.update_session_last_bot_message(session.id, sent_message.message_id)
+                if durable_delivery:
+                    await repo.enqueue_delivery(
+                        bot_response.id,
+                        question.id,
+                        is_private=is_private,
+                        chat_id=message.chat.id,
+                        reply_to_message_id=message.message_id,
+                        message_thread_id=message.message_thread_id,
+                        text_value=expert_result.text,
+                    )
+            if reserved_credits:
+                await self.credit_service.commit(repo, user_id, request_id, reserved_credits)
+                await repo.set_question_credits_charged(question.id, reserved_credits)
             await repo.update_question_filter_result(
                 question.id,
                 normalized_question=normalized,
@@ -243,7 +375,16 @@ class QuestionService:
             if relation:
                 await repo.update_question_context_relation(question.id, relation.relation)
 
+            if is_private:
+                updated_summary = self._updated_private_summary(
+                    session.summary,
+                    gate_result.question_text,
+                    expert_result.text,
+                )
+                await repo.update_session_summary(session.id, updated_summary)
+
             if self._should_store_cache(
+                is_private=is_private,
                 contextual=contextual,
                 previous_answer=previous_answer,
                 question_text=gate_result.question_text,
@@ -255,7 +396,21 @@ class QuestionService:
                     answer_text=expert_result.text,
                     source_question_id=question.id,
                     category=filter_result.category,
+                    response_mode=response_mode,
                 )
+
+            if durable_delivery:
+                await repo.session.commit()
+                credits_committed = bool(reserved_credits)
+            else:
+                sent_message = await self._send_answer_parts(bot, message, expert_result.text)
+                if bot_response is not None:
+                    bot_response.telegram_message_id = sent_message.message_id
+                await repo.update_session_last_bot_message(session.id, sent_message.message_id)
+                if reserved_credits:
+                    credits_committed = True
+                if is_private:
+                    await self._send_feedback_prompt(bot, message.chat.id, question.id)
 
             logger.info(
                 "question_answered",
@@ -266,6 +421,8 @@ class QuestionService:
                 text_len=len(expert_result.text),
             )
         finally:
+            if reserved_credits and not credits_committed:
+                await self.credit_service.release(repo, user_id, request_id, reserved_credits)
             self.gate.release_concurrent(user_id)
 
     def _cache_lookup_allowed(self, question_text: str) -> bool:
@@ -277,16 +434,60 @@ class QuestionService:
     def _should_store_cache(
         self,
         *,
+        is_private: bool,
         contextual: bool,
         previous_answer: str | None,
         question_text: str,
     ) -> bool:
-        if not self.settings.answer_cache_enabled:
+        if is_private or not self.settings.answer_cache_enabled:
             return False
         if contextual or previous_answer:
             return False
         key = normalize_question_key(question_text)
         return len(key) >= self.settings.answer_cache_min_question_len
+
+    def _cache_key(self, question_text: str, mode: ResponseMode | str) -> str:
+        normalized = normalize_question_key(question_text)
+        return (
+            f"{self.settings.knowledge_base_version}:"
+            f"{self.settings.prompt_version}:{str(mode)}:{normalized}"
+        )
+
+    def _updated_private_summary(self, current: str | None, question: str, answer: str) -> str:
+        entry = f"Пользователь: {question}\nАссистент: {answer}"
+        combined = f"{current}\n\n{entry}" if current else entry
+        return combined[-self.settings.private_memory_max_chars :]
+
+    @staticmethod
+    async def _send_feedback_prompt(bot: Bot, chat_id: int, question_id) -> None:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="👍", callback_data=f"feedback:up:{question_id}"),
+                    InlineKeyboardButton(text="👎", callback_data=f"feedback:down:{question_id}"),
+                ]
+            ]
+        )
+        try:
+            await bot.send_message(chat_id, "Оцените ответ:", reply_markup=keyboard)
+        except TelegramAPIError as exc:
+            logger.warning("feedback_prompt_failed", chat_id=chat_id, error=str(exc))
+
+    async def deliver_job(self, bot: Bot, job):
+        source_message = Message(
+            message_id=job.reply_to_message_id or 0,
+            date=1,
+            chat=Chat(
+                id=job.chat_id,
+                type="private" if job.is_private else "supergroup",
+            ),
+            text="",
+            message_thread_id=job.message_thread_id,
+        )
+        sent_message = await self._send_answer_parts(bot, source_message, job.text)
+        if job.is_private:
+            await self._send_feedback_prompt(bot, job.chat_id, job.question_id)
+        return sent_message
 
     async def _store_answer_cache(
         self,
@@ -297,13 +498,16 @@ class QuestionService:
         answer_text: str,
         source_question_id,
         category: str | None,
+        response_mode: ResponseMode | str,
     ) -> None:
         keys: dict[str, str] = {}
-        raw_key = normalize_question_key(raw_question)
-        if len(raw_key) >= self.settings.answer_cache_min_question_len:
+        raw_normalized = normalize_question_key(raw_question)
+        raw_key = self._cache_key(raw_question, response_mode)
+        if len(raw_normalized) >= self.settings.answer_cache_min_question_len:
             keys[raw_key] = raw_question
-        norm_key = normalize_question_key(normalized_question)
-        if len(norm_key) >= self.settings.answer_cache_min_question_len:
+        norm_normalized = normalize_question_key(normalized_question)
+        norm_key = self._cache_key(normalized_question, response_mode)
+        if len(norm_normalized) >= self.settings.answer_cache_min_question_len:
             keys.setdefault(norm_key, normalized_question)
 
         for key, display in keys.items():

@@ -10,6 +10,22 @@
 
 Production-ready MVP: closed-group fermentation/hospitality expert bot on Timeweb App Platform (Python 3.12, FastAPI, aiogram 3, PostgreSQL, three Timeweb AI agents).
 
+## 2026 private-bot upgrade
+
+Implemented after the original group MVP:
+
+- administrator-approved private allow-list;
+- `/start`, `/new`, `/forget`, `/quick`, `/deep`, `/mode`, `/balance`,
+  `/remember`, `/profile`, `/help`, and `/privacy`;
+- persistent private conversation memory and confirmed profile facts;
+- internal credit accounts, reservations, charges, releases, and idempotent manual grants;
+- response-specific token limits and versioned non-personal FAQ cache;
+- durable Telegram update queue and transactional answer-delivery outbox;
+- persistent kill switch, distributed PostgreSQL processing lock, and user feedback;
+- detailed AI usage fields and actual-or-estimated cost accounting.
+
+Payment providers, Telegram Stars, package sales, receipts, and refunds remain out of scope.
+
 ## Target tree
 
 ```text
