@@ -12,7 +12,8 @@ from app.main import create_app
 
 
 @pytest.fixture(autouse=True)
-def _clear_settings() -> None:
+def _clear_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
     clear_settings_cache()
     yield
     clear_settings_cache()

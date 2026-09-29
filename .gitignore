@@ -23,6 +23,7 @@ ENV/
 .env
 .env.local
 .env.*.local
+variables.env
 *.pem
 
 # IDE / OS

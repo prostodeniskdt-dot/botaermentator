@@ -94,7 +94,9 @@ Shared `TimewebClient` → `POST /api/v1/cloud-ai/agents/{id}/call` with timeout
 | 3 Main Expert | Final answer | Yes | Yes (panel) | Static error |
 
 App-managed context: group replies use the previous Q/A after Agent 2. Private conversations
-use a bounded working summary, recent turns, and explicit confirmed profile facts.
+store the complete Q/A history in PostgreSQL. Agent 3 receives a compact working summary,
+the newest clipped turns, and confirmed profile facts. Full previous answers are not
+replayed as a rolling transcript.
 
 ### Persistence (`app/db`)
 

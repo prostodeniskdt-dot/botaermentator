@@ -310,19 +310,15 @@ class QuestionService:
 
             conversation_history: list[tuple[str, str]] = []
             user_memory: str | None = None
+            conversation_summary: str | None = None
             if is_private:
-                if not session.summary:
-                    history_rows = await repo.get_recent_qa_for_session(
-                        session.id, limit=self.settings.private_context_turns
-                    )
-                    conversation_history = [
-                        (row_question.raw_question, row_answer.response_text)
-                        for row_question, row_answer in history_rows
-                    ]
-                user = await repo.get_user_by_telegram_id(user_id)
-                if user is not None:
-                    facts = user.profile_facts.get("confirmed", [])
-                    user_memory = "\n".join(f"- {fact}" for fact in facts) or None
+                conversation_history, user_memory = await self._load_private_context(
+                    repo,
+                    session.id,
+                    user_id,
+                    has_summary=bool(session.summary),
+                )
+                conversation_summary = session.summary
                 previous_question = None
                 previous_answer = None
 
@@ -337,7 +333,7 @@ class QuestionService:
                 response_mode=response_mode,
                 request_id=request_id,
                 user_memory=user_memory,
-                conversation_summary=session.summary if is_private else None,
+                conversation_summary=conversation_summary,
             )
             if expert_result is None or not expert_result.text.strip():
                 await self._fail_closed(bot, message, question.id, session.id, repo)
@@ -425,6 +421,125 @@ class QuestionService:
                 await self.credit_service.release(repo, user_id, request_id, reserved_credits)
             self.gate.release_concurrent(user_id)
 
+    _HISTORY_QUESTION_MAX_CHARS = 180
+    _HISTORY_ANSWER_MAX_CHARS = 280
+    _SUMMARY_HEADER = "Рабочая память диалога:"
+    _SUMMARY_QUESTION_MAX_CHARS = 140
+    _SUMMARY_NOTE_MAX_CHARS = 220
+
+    async def _load_private_context(
+        self,
+        repo: Repository,
+        session_id,
+        user_id: int,
+        *,
+        has_summary: bool = False,
+    ) -> tuple[list[tuple[str, str]], str | None]:
+        turn_limit = self.settings.private_context_turns
+        if has_summary:
+            turn_limit = min(turn_limit, 3)
+        history_rows = await repo.get_recent_qa_for_session(session_id, limit=turn_limit)
+        conversation_history = [
+            (
+                self._clip_context_text(
+                    row_question.raw_question, self._HISTORY_QUESTION_MAX_CHARS
+                ),
+                self._first_sentences(
+                    row_answer.response_text, self._HISTORY_ANSWER_MAX_CHARS
+                ),
+            )
+            for row_question, row_answer in history_rows
+        ]
+        conversation_history = self._limit_conversation_history(
+            conversation_history,
+            max_chars=self.settings.private_memory_max_chars,
+        )
+        user = await repo.get_user_by_telegram_id(user_id)
+        if user is None:
+            return conversation_history, None
+        facts = user.profile_facts.get("confirmed", [])
+        user_memory = "\n".join(f"- {fact}" for fact in facts) or None
+        return conversation_history, user_memory
+
+    def _updated_private_summary(
+        self,
+        current: str | None,
+        question: str,
+        answer: str,
+    ) -> str:
+        note = (
+            f"- {self._clip_context_text(question.strip(), self._SUMMARY_QUESTION_MAX_CHARS)}"
+            f" → {self._first_sentences(answer, self._SUMMARY_NOTE_MAX_CHARS)}"
+        )
+        previous = ""
+        if current:
+            previous = current.removeprefix(self._SUMMARY_HEADER).strip()
+        combined = f"{previous}\n{note}".strip() if previous else note
+        budget = max(self.settings.private_memory_max_chars - len(self._SUMMARY_HEADER) - 1, 0)
+        if len(combined) > budget:
+            combined = combined[-budget:]
+            newline = combined.find("\n")
+            if 0 <= newline < 120:
+                combined = combined[newline + 1 :].lstrip()
+        return f"{self._SUMMARY_HEADER}\n{combined}".strip()
+
+    @staticmethod
+    def _first_sentences(text: str, max_chars: int) -> str:
+        compact = " ".join(text.split())
+        if max_chars <= 0:
+            return ""
+        if len(compact) <= max_chars:
+            return compact
+        window = compact[:max_chars]
+        cut_at = -1
+        for separator in (". ", "! ", "? "):
+            cut_at = max(cut_at, window.rfind(separator))
+        if cut_at >= max_chars // 3:
+            return window[: cut_at + 1].strip()
+        return QuestionService._clip_context_text(compact, max_chars)
+
+    @staticmethod
+    def _limit_conversation_history(
+        history: list[tuple[str, str]],
+        *,
+        max_chars: int,
+    ) -> list[tuple[str, str]]:
+        if max_chars <= 0:
+            return []
+
+        selected: list[tuple[str, str]] = []
+        remaining = max_chars
+        for question, answer in reversed(history):
+            question = question.strip()
+            answer = answer.strip()
+            turn_size = len(question) + len(answer)
+            if turn_size <= remaining:
+                selected.append((question, answer))
+                remaining -= turn_size
+                continue
+            if selected:
+                break
+
+            question_limit = min(len(question), max(1, max_chars // 3))
+            clipped_question = QuestionService._clip_context_text(question, question_limit)
+            answer_limit = max_chars - len(clipped_question)
+            clipped_answer = QuestionService._clip_context_text(answer, answer_limit)
+            selected.append((clipped_question, clipped_answer))
+            break
+
+        selected.reverse()
+        return selected
+
+    @staticmethod
+    def _clip_context_text(text: str, limit: int) -> str:
+        if limit <= 0:
+            return ""
+        if len(text) <= limit:
+            return text
+        if limit == 1:
+            return "…"
+        return f"{text[: limit - 1].rstrip()}…"
+
     def _cache_lookup_allowed(self, question_text: str) -> bool:
         if not self.settings.answer_cache_enabled:
             return False
@@ -452,11 +567,6 @@ class QuestionService:
             f"{self.settings.knowledge_base_version}:"
             f"{self.settings.prompt_version}:{str(mode)}:{normalized}"
         )
-
-    def _updated_private_summary(self, current: str | None, question: str, answer: str) -> str:
-        entry = f"Пользователь: {question}\nАссистент: {answer}"
-        combined = f"{current}\n\n{entry}" if current else entry
-        return combined[-self.settings.private_memory_max_chars :]
 
     @staticmethod
     async def _send_feedback_prompt(bot: Bot, chat_id: int, question_id) -> None:

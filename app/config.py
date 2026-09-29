@@ -90,7 +90,7 @@ class Settings(BaseSettings):
     private_context_turns: int = 6
     private_memory_max_chars: int = 6000
     knowledge_base_version: str = "1"
-    prompt_version: str = "1"
+    prompt_version: str = "3"
     durable_update_queue_enabled: bool = False
     update_queue_poll_seconds: float = 0.5
     update_queue_max_attempts: int = 3
