@@ -247,3 +247,70 @@ def test_cache_key_is_versioned(settings) -> None:
 
     assert quick != deep
     assert quick.startswith(f"{settings.knowledge_base_version}:{settings.prompt_version}:")
+
+
+def test_standalone_private_questions_are_eligible_for_cache(settings) -> None:
+    service = QuestionService(
+        settings,
+        gate=MagicMock(),
+        session_service=MagicMock(),
+        blocking_service=MagicMock(),
+        industry_filter=MagicMock(),
+        context_relation=MagicMock(),
+        main_expert=MagicMock(),
+    )
+
+    assert service._should_store_cache(
+        contextual=False,
+        previous_answer=None,
+        question_text="Что такое ферментация?",
+    )
+    assert not service._should_store_cache(
+        contextual=True,
+        previous_answer=None,
+        question_text="Что такое ферментация?",
+    )
+
+
+@pytest.mark.asyncio
+async def test_cached_private_answer_is_saved_to_user_history(settings) -> None:
+    service = QuestionService(
+        settings,
+        gate=MagicMock(),
+        session_service=MagicMock(),
+        blocking_service=MagicMock(),
+        industry_filter=MagicMock(),
+        context_relation=MagicMock(),
+        main_expert=MagicMock(),
+    )
+    repo = AsyncMock()
+    session = MagicMock(id=uuid.uuid4(), summary=None)
+    repo.create_question.return_value = MagicMock(id=uuid.uuid4())
+    cached = MagicMock(
+        answer_text="Ферментация — управляемое изменение продукта.", category="fermentation"
+    )
+    bot = AsyncMock()
+    service._send_answer_parts = AsyncMock(return_value=MagicMock(message_id=99))
+    message = MagicMock()
+    message.chat.type = "private"
+    message.reply_to_message = None
+    message.message_id = 5
+
+    await service._serve_cached_answer(
+        repo,
+        bot,
+        message,
+        update_id=1,
+        user_id=7,
+        question_text="Что такое ферментация?",
+        cache_key="cache-key",
+        cached=cached,
+        session=session,
+        response_mode=ResponseMode.QUICK,
+    )
+
+    repo.create_question.assert_awaited()
+    repo.create_bot_response.assert_awaited()
+    repo.update_session_summary.assert_awaited()
+    repo.record_cache_hit.assert_awaited_once_with("cache-key")
+    service.main_expert.answer.assert_not_called()

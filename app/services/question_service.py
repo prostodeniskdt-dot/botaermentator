@@ -162,35 +162,17 @@ class QuestionService:
         try:
             await bot.send_chat_action(message.chat.id, "typing")
 
-            if is_private:
-                reserved = await self.credit_service.reserve(
-                    repo, user_id, request_id, response_mode
-                )
-                if reserved is None:
-                    await self._reply_text(bot, message, INSUFFICIENT_CREDITS)
-                    return
-                reserved_credits = reserved
-
-            # Standalone questions (not reply to bot): serve from cache before any agents.
-            if (
-                not is_private
-                and reply_session_id is None
-                and self._cache_lookup_allowed(gate_result.question_text)
+            if await self._maybe_serve_cached_answer(
+                repo,
+                bot,
+                message,
+                update_id=update_id,
+                user_id=user_id,
+                question_text=gate_result.question_text,
+                response_mode=response_mode,
+                allowed=not is_private and reply_session_id is None,
             ):
-                cache_key = self._cache_key(gate_result.question_text, response_mode)
-                cached = await repo.get_cached_answer(cache_key)
-                if cached is not None:
-                    await self._serve_cached_answer(
-                        repo,
-                        bot,
-                        message,
-                        update_id=update_id,
-                        user_id=user_id,
-                        question_text=gate_result.question_text,
-                        cache_key=cache_key,
-                        cached=cached,
-                    )
-                    return
+                return
 
             if is_private:
                 session, relation = await self.session_service.resolve_private_session(
@@ -205,27 +187,28 @@ class QuestionService:
                 )
 
             contextual = bool(relation and relation.include_previous_context)
-            if (
-                not is_private
-                and not contextual
-                and self._cache_lookup_allowed(gate_result.question_text)
+            if await self._maybe_serve_cached_answer(
+                repo,
+                bot,
+                message,
+                update_id=update_id,
+                user_id=user_id,
+                question_text=gate_result.question_text,
+                response_mode=response_mode,
+                allowed=not contextual,
+                session=session,
+                relation=relation.relation if relation else None,
             ):
-                cache_key = self._cache_key(gate_result.question_text, response_mode)
-                cached = await repo.get_cached_answer(cache_key)
-                if cached is not None:
-                    await self._serve_cached_answer(
-                        repo,
-                        bot,
-                        message,
-                        update_id=update_id,
-                        user_id=user_id,
-                        question_text=gate_result.question_text,
-                        cache_key=cache_key,
-                        cached=cached,
-                        session=session,
-                        relation=relation.relation if relation else None,
-                    )
+                return
+
+            if is_private:
+                reserved = await self.credit_service.reserve(
+                    repo, user_id, request_id, response_mode
+                )
+                if reserved is None:
+                    await self._reply_text(bot, message, INSUFFICIENT_CREDITS)
                     return
+                reserved_credits = reserved
 
             question = await repo.create_question(
                 session_id=session.id,
@@ -379,7 +362,6 @@ class QuestionService:
                 await repo.update_session_summary(session.id, updated_summary)
 
             if self._should_store_cache(
-                is_private=is_private,
                 contextual=contextual,
                 previous_answer=previous_answer,
                 question_text=gate_result.question_text,
@@ -544,17 +526,51 @@ class QuestionService:
     def _should_store_cache(
         self,
         *,
-        is_private: bool,
         contextual: bool,
         previous_answer: str | None,
         question_text: str,
     ) -> bool:
-        if is_private or not self.settings.answer_cache_enabled:
+        if not self.settings.answer_cache_enabled:
             return False
         if contextual or previous_answer:
             return False
         key = normalize_question_key(question_text)
         return len(key) >= self.settings.answer_cache_min_question_len
+
+    async def _maybe_serve_cached_answer(
+        self,
+        repo: Repository,
+        bot: Bot,
+        message: Message,
+        *,
+        update_id: int,
+        user_id: int,
+        question_text: str,
+        response_mode: ResponseMode,
+        allowed: bool,
+        session=None,
+        relation: str | None = None,
+    ) -> bool:
+        if not allowed or not self._cache_lookup_allowed(question_text):
+            return False
+        cache_key = self._cache_key(question_text, response_mode)
+        cached = await repo.get_cached_answer(cache_key)
+        if cached is None:
+            return False
+        await self._serve_cached_answer(
+            repo,
+            bot,
+            message,
+            update_id=update_id,
+            user_id=user_id,
+            question_text=question_text,
+            cache_key=cache_key,
+            cached=cached,
+            session=session,
+            relation=relation,
+            response_mode=response_mode,
+        )
+        return True
 
     def _cache_key(self, question_text: str, mode: ResponseMode | str) -> str:
         normalized = normalize_question_key(question_text)
@@ -620,6 +636,7 @@ class QuestionService:
         cached: AnswerCache,
         session=None,
         relation: str | None = None,
+        response_mode: ResponseMode | str = ResponseMode.QUICK,
     ) -> None:
         if session is None:
             session = await self.session_service.create_new_session(repo, message)
@@ -632,6 +649,7 @@ class QuestionService:
             reply_to_message_id=(
                 message.reply_to_message.message_id if message.reply_to_message else None
             ),
+            response_mode=response_mode,
         )
         await repo.update_question_filter_result(
             question.id,
@@ -652,6 +670,13 @@ class QuestionService:
                 telegram_message_id=sent_message.message_id,
             )
         await repo.update_session_last_bot_message(session.id, sent_message.message_id)
+        if message.chat.type == "private":
+            updated_summary = self._updated_private_summary(
+                getattr(session, "summary", None),
+                question_text,
+                cached.answer_text,
+            )
+            await repo.update_session_summary(session.id, updated_summary)
         await repo.record_cache_hit(cache_key)
         logger.info(
             "answer_cache_hit",

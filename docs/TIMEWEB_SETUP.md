@@ -78,6 +78,7 @@ python scripts/set_webhook.py
 - `GET /health` → 200
 - `GET /ready` → 200 with `"database": true`
 - Mention bot in allowed group → reply
+- Repeat a standalone FAQ in private chat → cached answer, no new Timeweb call
 - Message without mention → ignored
 - Wrong group → bot leaves chat
 - Unknown private user sends `/start` → pending-access message
