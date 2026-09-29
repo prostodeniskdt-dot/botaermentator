@@ -210,6 +210,10 @@ async def save_feedback(callback: CallbackQuery) -> None:
     rating = 1 if rating_value == "up" else -1
     async with session_scope() as db:
         repo = Repository(db)
+        user = await repo.get_user_by_telegram_id(callback.from_user.id)
+        if user is None or user.access_status != AccessStatus.ACTIVE:
+            await callback.answer("Доступ не разрешён", show_alert=True)
+            return
         question = await repo.get_question(question_id)
         session = await repo.get_session(question.session_id) if question else None
         if session is None or session.telegram_user_id != callback.from_user.id:
