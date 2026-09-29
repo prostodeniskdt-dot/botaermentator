@@ -84,7 +84,27 @@ async def test_send_answer_parts_uses_rich_markdown(settings: Settings) -> None:
     assert isinstance(rich, InputRichMessage)
     assert rich.markdown == "# Title\n\n**bold** answer"
     assert kwargs["reply_parameters"].message_id == 42
+    assert "reply_markup" not in kwargs
     bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_private_answer_keeps_bottom_menu(settings: Settings) -> None:
+    settings.rich_messages_enabled = True
+    service = _service(settings)
+    bot = AsyncMock()
+    bot.send_rich_message = AsyncMock(return_value=MagicMock(message_id=4))
+    message = Message(
+        message_id=42,
+        date=1,
+        chat=Chat(id=7, type="private"),
+        from_user=User(id=7, is_bot=False, first_name="U"),
+        text="q",
+    )
+    await service._send_answer_parts(bot, message, "Ответ")
+    markup = bot.send_rich_message.await_args.kwargs["reply_markup"]
+    labels = [button.text for row in markup.keyboard for button in row]
+    assert labels == ["Кратко", "Подробно", "Новая тема", "Баланс", "Профиль", "Помощь"]
 
 
 @pytest.mark.asyncio

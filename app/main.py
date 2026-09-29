@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from functools import partial
 
 from aiogram import BaseMiddleware
-from aiogram.types import TelegramObject, Update
+from aiogram.types import BotCommand, TelegramObject, Update
 from fastapi import FastAPI
 
 from app import __version__
@@ -74,6 +74,10 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
 
             bot = create_bot(settings)
             me = await bot.get_me()
+            try:
+                await bot.set_my_commands(_private_commands())
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("telegram_commands_registration_failed", error=str(exc))
             bot_username = settings.bot_username or me.username or ""
             object.__setattr__(settings, "bot_username", bot_username)
 
@@ -158,6 +162,20 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
             await bot.session.close()
         reset_engine()
         logger.info("app_stopping")
+
+
+def _private_commands() -> list[BotCommand]:
+    return [
+        BotCommand(command="new", description="Начать новую тему"),
+        BotCommand(command="quick", description="Краткий режим"),
+        BotCommand(command="deep", description="Подробный режим"),
+        BotCommand(command="balance", description="Баланс кредитов"),
+        BotCommand(command="profile", description="Сохранённые факты"),
+        BotCommand(command="remember", description="Запомнить факт"),
+        BotCommand(command="forget", description="Очистить рабочую память"),
+        BotCommand(command="help", description="Помощь"),
+        BotCommand(command="privacy", description="Какие данные хранятся"),
+    ]
 
 
 async def _register_webhook(bot, settings, logger) -> None:

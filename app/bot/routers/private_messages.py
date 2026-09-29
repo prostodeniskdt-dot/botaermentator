@@ -8,6 +8,16 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from app.bot.keyboards import (
+    BUTTON_BALANCE,
+    BUTTON_DEEP,
+    BUTTON_HELP,
+    BUTTON_NEW,
+    BUTTON_PROFILE,
+    BUTTON_QUICK,
+    MENU_BUTTONS,
+    private_menu_keyboard,
+)
 from app.db.repositories import Repository
 from app.db.session import session_scope
 from app.domain.enums import AccessStatus, ResponseMode
@@ -50,13 +60,18 @@ async def _active_user(message: Message, settings, bot, access_service):
         return user
 
 
+async def _answer(message: Message, text: str, **kwargs) -> None:
+    kwargs.setdefault("reply_markup", private_menu_keyboard())
+    await message.answer(text, **kwargs)
+
+
 @router.message(F.chat.type == "private", Command("start"))
 async def private_start(message: Message, settings, bot, access_service) -> None:
     async with session_scope() as db:
         repo = Repository(db)
         user = await access_service.register_request(repo, message, bot)
     if user.access_status == AccessStatus.ACTIVE:
-        await message.answer(WELCOME)
+        await _answer(message, WELCOME)
     else:
         await message.answer(_access_message(user.access_status, settings))
 
@@ -64,7 +79,7 @@ async def private_start(message: Message, settings, bot, access_service) -> None
 @router.message(F.chat.type == "private", Command("help"))
 async def private_help(message: Message, settings, bot, access_service) -> None:
     if await _active_user(message, settings, bot, access_service):
-        await message.answer(HELP)
+        await _answer(message, HELP)
 
 
 @router.message(F.chat.type == "private", Command("new"))
@@ -73,7 +88,7 @@ async def private_new(message: Message, settings, bot, access_service) -> None:
         return
     async with session_scope() as db:
         await Repository(db).close_private_sessions(message.from_user.id)  # type: ignore[union-attr]
-    await message.answer(NEW_DIALOG_STARTED)
+    await _answer(message, NEW_DIALOG_STARTED)
 
 
 @router.message(F.chat.type == "private", Command("quick"))
@@ -85,7 +100,7 @@ async def private_quick(message: Message, settings, bot, access_service) -> None
             message.from_user.id,
             ResponseMode.QUICK,  # type: ignore[union-attr]
         )
-    await message.answer(MODE_QUICK.format(credits=settings.quick_mode_credits))
+    await _answer(message, MODE_QUICK.format(credits=settings.quick_mode_credits))
 
 
 @router.message(F.chat.type == "private", Command("deep"))
@@ -97,7 +112,7 @@ async def private_deep(message: Message, settings, bot, access_service) -> None:
             message.from_user.id,
             ResponseMode.DEEP,  # type: ignore[union-attr]
         )
-    await message.answer(MODE_DEEP.format(credits=settings.deep_mode_credits))
+    await _answer(message, MODE_DEEP.format(credits=settings.deep_mode_credits))
 
 
 @router.message(F.chat.type == "private", Command("mode"))
@@ -106,9 +121,9 @@ async def private_mode(message: Message, settings, bot, access_service) -> None:
     if user is None:
         return
     if user.response_mode == ResponseMode.DEEP:
-        await message.answer(MODE_DEEP.format(credits=settings.deep_mode_credits))
+        await _answer(message, MODE_DEEP.format(credits=settings.deep_mode_credits))
     else:
-        await message.answer(MODE_QUICK.format(credits=settings.quick_mode_credits))
+        await _answer(message, MODE_QUICK.format(credits=settings.quick_mode_credits))
 
 
 @router.message(F.chat.type == "private", Command("balance"))
@@ -120,13 +135,13 @@ async def private_balance(message: Message, settings, bot, access_service) -> No
             message.from_user.id  # type: ignore[union-attr]
         )
         text = BALANCE.format(balance=account.balance, reserved=account.reserved)
-    await message.answer(text)
+    await _answer(message, text)
 
 
 @router.message(F.chat.type == "private", Command("privacy"))
 async def private_privacy(message: Message, settings, bot, access_service) -> None:
     if await _active_user(message, settings, bot, access_service):
-        await message.answer(PRIVACY)
+        await _answer(message, PRIVACY)
 
 
 @router.message(F.chat.type == "private", Command("remember"))
@@ -135,14 +150,14 @@ async def private_remember(message: Message, settings, bot, access_service) -> N
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) != 2 or not parts[1].strip():
-        await message.answer("Использование: /remember <факт, который нужно запомнить>")
+        await _answer(message, "Напишите факт так: /remember объём партии — 10 л")
         return
     async with session_scope() as db:
         await Repository(db).add_user_profile_fact(
             message.from_user.id,
             parts[1].strip(),  # type: ignore[union-attr]
         )
-    await message.answer("Факт сохранён в подтверждённом профиле.")
+    await _answer(message, "Факт сохранён в подтверждённом профиле.")
 
 
 @router.message(F.chat.type == "private", Command("profile"))
@@ -152,9 +167,9 @@ async def private_profile(message: Message, settings, bot, access_service) -> No
         return
     facts = user.profile_facts.get("confirmed", [])
     if not facts:
-        await message.answer("Подтверждённых фактов пока нет. Добавьте их через /remember.")
+        await _answer(message, "Подтверждённых фактов пока нет. Добавьте их через /remember.")
         return
-    await message.answer("Подтверждённые сведения:\n" + "\n".join(f"• {fact}" for fact in facts))
+    await _answer(message, "Подтверждённые сведения:\n" + "\n".join(f"• {fact}" for fact in facts))
 
 
 @router.message(F.chat.type == "private", Command("forget"))
@@ -235,6 +250,19 @@ def _parse_mode_prefix(text: str, default_mode: str) -> tuple[ResponseMode, str]
         if lowered.startswith(prefix):
             return ResponseMode.DEEP, stripped[len(prefix) :].strip()
     return ResponseMode(default_mode), stripped
+
+
+@router.message(F.chat.type == "private", F.text.in_(MENU_BUTTONS))
+async def private_menu_button(message: Message, settings, bot, access_service) -> None:
+    actions = {
+        BUTTON_QUICK: private_quick,
+        BUTTON_DEEP: private_deep,
+        BUTTON_NEW: private_new,
+        BUTTON_BALANCE: private_balance,
+        BUTTON_PROFILE: private_profile,
+        BUTTON_HELP: private_help,
+    }
+    await actions[message.text or ""](message, settings, bot, access_service)
 
 
 @router.message(F.chat.type == "private", F.text, ~F.text.startswith("/"))

@@ -9,8 +9,6 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.types import (
     Chat,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
     InputRichMessage,
     Message,
     ReplyParameters,
@@ -21,6 +19,7 @@ from app.agents.industry_filter import IndustryFilterAgent
 from app.agents.main_expert import MainExpertAgent
 from app.bot.formatting.telegram_html import format_response_html, split_html_message
 from app.bot.formatting.telegram_rich import prep_rich_markdown, split_rich_message
+from app.bot.keyboards import private_menu_keyboard
 from app.bot.mention import AddressKind
 from app.config import Settings
 from app.db.models.entities import AnswerCache
@@ -405,8 +404,6 @@ class QuestionService:
                 await repo.update_session_last_bot_message(session.id, sent_message.message_id)
                 if reserved_credits:
                     credits_committed = True
-                if is_private:
-                    await self._send_feedback_prompt(bot, message.chat.id, question.id)
 
             logger.info(
                 "question_answered",
@@ -444,9 +441,7 @@ class QuestionService:
                 self._clip_context_text(
                     row_question.raw_question, self._HISTORY_QUESTION_MAX_CHARS
                 ),
-                self._first_sentences(
-                    row_answer.response_text, self._HISTORY_ANSWER_MAX_CHARS
-                ),
+                self._first_sentences(row_answer.response_text, self._HISTORY_ANSWER_MAX_CHARS),
             )
             for row_question, row_answer in history_rows
         ]
@@ -568,21 +563,6 @@ class QuestionService:
             f"{self.settings.prompt_version}:{str(mode)}:{normalized}"
         )
 
-    @staticmethod
-    async def _send_feedback_prompt(bot: Bot, chat_id: int, question_id) -> None:
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="👍", callback_data=f"feedback:up:{question_id}"),
-                    InlineKeyboardButton(text="👎", callback_data=f"feedback:down:{question_id}"),
-                ]
-            ]
-        )
-        try:
-            await bot.send_message(chat_id, "Оцените ответ:", reply_markup=keyboard)
-        except TelegramAPIError as exc:
-            logger.warning("feedback_prompt_failed", chat_id=chat_id, error=str(exc))
-
     async def deliver_job(self, bot: Bot, job):
         source_message = Message(
             message_id=job.reply_to_message_id or 0,
@@ -594,10 +574,7 @@ class QuestionService:
             text="",
             message_thread_id=job.message_thread_id,
         )
-        sent_message = await self._send_answer_parts(bot, source_message, job.text)
-        if job.is_private:
-            await self._send_feedback_prompt(bot, job.chat_id, job.question_id)
-        return sent_message
+        return await self._send_answer_parts(bot, source_message, job.text)
 
     async def _store_answer_cache(
         self,
@@ -757,6 +734,8 @@ class QuestionService:
             "rich_message": InputRichMessage(markdown=markdown),
             "message_thread_id": message.message_thread_id,
         }
+        if message.chat.type == "private" and reply:
+            kwargs["reply_markup"] = private_menu_keyboard()
         if reply:
             kwargs["reply_parameters"] = ReplyParameters(message_id=message.message_id)
             try:
@@ -794,6 +773,8 @@ class QuestionService:
         }
         if parse_mode is not None:
             kwargs["parse_mode"] = parse_mode
+        if message.chat.type == "private" and reply:
+            kwargs["reply_markup"] = private_menu_keyboard()
         if reply:
             kwargs["reply_to_message_id"] = message.message_id
             try:

@@ -82,7 +82,8 @@ python scripts/set_webhook.py
 - Wrong group → bot leaves chat
 - Unknown private user sends `/start` → pending-access message
 - Administrator receives the request and runs `/admin_allow <telegram_user_id>`
-- Approved user receives the starting balance and can ask a private question
+- Approved user receives the starting balance, the bottom menu, and can ask a private question
+- Answers are not followed by a rating prompt
 - `/quick`, `/deep`, `/new`, `/remember`, `/profile`, `/forget`, and `/balance` work
 - Restart during processing → queued update or answer delivery resumes
 
