@@ -26,6 +26,8 @@ class CreditService:
         mode: ResponseMode | str,
     ) -> int | None:
         amount = self.cost_for_mode(mode)
+        if telegram_user_id in self.settings.admin_user_ids:
+            return 0
         if await repo.reserve_credits(telegram_user_id, request_id, amount):
             return amount
         return None

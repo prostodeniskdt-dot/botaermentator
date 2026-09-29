@@ -26,6 +26,7 @@ from app.domain.messages import (
     ACCESS_PENDING,
     ACCESS_REJECTED,
     BALANCE,
+    BALANCE_UNLIMITED,
     HELP,
     MEMORY_FORGOTTEN,
     MODE_DEEP,
@@ -129,6 +130,9 @@ async def private_mode(message: Message, settings, bot, access_service) -> None:
 @router.message(F.chat.type == "private", Command("balance"))
 async def private_balance(message: Message, settings, bot, access_service) -> None:
     if not await _active_user(message, settings, bot, access_service):
+        return
+    if message.from_user and message.from_user.id in settings.admin_user_ids:
+        await _answer(message, BALANCE_UNLIMITED)
         return
     async with session_scope() as db:
         account = await Repository(db).get_or_create_credit_account(
