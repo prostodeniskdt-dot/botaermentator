@@ -1,6 +1,7 @@
 # Fermentation Expert Telegram Bot (MVP)
 
-Closed-group Telegram consultant for fermentation and hospitality, backed by three Timeweb Cloud AI agents.
+Allow-listed private and closed-group Telegram consultant for fermentation and hospitality,
+backed by three Timeweb Cloud AI agents.
 
 ## Stack
 
@@ -8,11 +9,20 @@ Python 3.12 · FastAPI · aiogram 3 · PostgreSQL · SQLAlchemy 2 · Timeweb Clo
 
 ## Status
 
-Stage 1 scaffold: FastAPI app with `/health` and `/ready`, configuration, Docker, base tests.
+Production-oriented bot with:
 
-See `docs/IMPLEMENTATION_PLAN.md` and `docs/ARCHITECTURE.md`.
+- administrator-approved private access;
+- persistent personal conversations and confirmed profile facts;
+- concise and detailed answer modes;
+- internal credits with manual grants (no payment integration);
+- durable PostgreSQL queues for Telegram updates and answer delivery;
+- group questions through `/ask`, `@mention`, or reply;
+- AI usage, feedback, limits, blocking, and versioned FAQ cache.
 
-## Local development (Stage 1)
+See `docs/IMPLEMENTATION_PLAN.md`, `docs/ARCHITECTURE.md`, and
+`docs/TIMEWEB_SETUP.md`.
+
+## Local development
 
 ```bash
 python -m venv .venv
@@ -61,3 +71,13 @@ Never commit `.env`, tokens, chat IDs, or agent IDs. Use `.env.example` as a tem
 ## Platform setup (your side)
 
 Telegram BotFather, Timeweb agents/KB/Postgres/App Platform — see the kickoff plan and (later) `docs/TIMEWEB_SETUP.md`.
+
+## Private access workflow
+
+1. A user sends `/start`.
+2. The bot records a pending request and tells the user to contact `@pprostodenis`.
+3. An administrator receives the Telegram ID and runs `/admin_allow <id>`.
+4. The user receives access and the configured starting credits.
+
+User identity and authorization are based on immutable Telegram user ID, never username.
+Payment providers, Telegram Stars, and package purchases are intentionally out of scope.

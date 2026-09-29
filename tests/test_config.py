@@ -54,6 +54,7 @@ def test_production_accepts_complete_settings(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("TELEGRAM_WEBHOOK_URL", "https://example.com/telegram/webhook")
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
     monkeypatch.setenv("ALLOWED_CHAT_ID", "-100123")
+    monkeypatch.setenv("ADMIN_USER_IDS", "42")
     monkeypatch.setenv("DATABASE_URL", "postgresql+asyncpg://u:p@localhost:5432/db")
     monkeypatch.setenv("TIMEWEB_AGENT_1_ID", "a1")
     monkeypatch.setenv("TIMEWEB_AGENT_1_TOKEN", "t1")
