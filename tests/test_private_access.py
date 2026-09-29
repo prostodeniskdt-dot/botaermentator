@@ -75,6 +75,7 @@ async def test_approve_grants_starting_credits_only_once(settings) -> None:
         settings.starting_credits,
         reason="starting_credits",
         admin_telegram_user_id=42,
+        request_id=uuid.uuid5(uuid.NAMESPACE_URL, "starting-credits:7"),
     )
 
 

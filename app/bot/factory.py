@@ -40,7 +40,8 @@ def create_dispatcher(
     dp["bot"] = None  # injected at runtime via webhook feed_update
     dp.include_router(membership_router)
     dp.include_router(admin_router)
-    dp.include_router(private_messages_router)
+    if settings.private_access_enabled:
+        dp.include_router(private_messages_router)
     dp.include_router(group_questions_router)
     return dp
 

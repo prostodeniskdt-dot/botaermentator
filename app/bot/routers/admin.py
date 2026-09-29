@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from html import escape
 
 from aiogram import F, Router
 from aiogram.filters import Command
@@ -163,8 +164,8 @@ async def admin_pending(message: Message, settings) -> None:
         return
     lines = ["Ожидают доступа:"]
     for user in users:
-        username = f"@{user.username}" if user.username else "без username"
-        lines.append(f"{user.telegram_user_id} — {username} — {user.first_name or ''}")
+        username = f"@{escape(user.username)}" if user.username else "без username"
+        lines.append(f"{user.telegram_user_id} — {username} — {escape(user.first_name or '')}")
     await message.answer("\n".join(lines))
 
 
@@ -211,7 +212,7 @@ async def admin_reject(message: Message, settings, access_service) -> None:
 
 
 @router.message(F.chat.type == "private", Command("admin_grant_credits"))
-async def admin_grant_credits(message: Message, settings) -> None:
+async def admin_grant_credits(message: Message, settings, update_id: int) -> None:
     if not _is_admin(message, settings):
         return
     parts = (message.text or "").split(maxsplit=3)
@@ -231,6 +232,7 @@ async def admin_grant_credits(message: Message, settings) -> None:
             amount,
             reason=reason,
             admin_telegram_user_id=message.from_user.id,  # type: ignore[union-attr]
+            request_id=uuid.uuid5(uuid.NAMESPACE_URL, f"admin-credit-grant:{update_id}"),
         )
     await message.answer(f"Начислено {amount}. Баланс пользователя: {account.balance}.")
 

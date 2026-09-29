@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import uuid
 from contextlib import suppress
+from html import escape
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
@@ -62,6 +64,7 @@ class AccessService:
                 self.settings.starting_credits,
                 reason="starting_credits",
                 admin_telegram_user_id=admin_telegram_user_id,
+                request_id=uuid.uuid5(uuid.NAMESPACE_URL, f"starting-credits:{telegram_user_id}"),
             )
         with suppress(TelegramAPIError):
             await bot.send_message(telegram_user_id, ACCESS_APPROVED)
@@ -81,8 +84,16 @@ class AccessService:
         )
 
     async def _notify_admins(self, bot: Bot, user) -> None:
-        username = f"@{user.username}" if user.username else "без username"
-        name = " ".join(filter(None, [user.first_name, user.last_name])) or "Без имени"
+        username = f"@{escape(user.username)}" if user.username else "без username"
+        name = (
+            " ".join(
+                filter(
+                    None,
+                    [escape(user.first_name or ""), escape(user.last_name or "")],
+                )
+            )
+            or "Без имени"
+        )
         text = (
             "Новая заявка на доступ\n"
             f"Имя: {name}\n"

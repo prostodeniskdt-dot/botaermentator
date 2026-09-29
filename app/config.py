@@ -94,6 +94,8 @@ class Settings(BaseSettings):
     durable_update_queue_enabled: bool = False
     update_queue_poll_seconds: float = 0.5
     update_queue_max_attempts: int = 3
+    update_queue_stale_seconds: int = 1800
+    update_queue_heartbeat_seconds: int = 30
 
     @field_validator("admin_user_ids", mode="before")
     @classmethod
@@ -244,6 +246,8 @@ class Settings(BaseSettings):
         }
         if self.is_production:
             required["TELEGRAM_WEBHOOK_URL"] = self.telegram_webhook_url
+            if self.private_access_enabled:
+                required["ADMIN_USER_IDS"] = self.admin_user_ids or None
 
         missing: list[str] = []
         for name, value in required.items():

@@ -8,6 +8,7 @@ from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.types import (
+    Chat,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputRichMessage,
@@ -156,6 +157,9 @@ class QuestionService:
         request_id = uuid.uuid4()
         reserved_credits = 0
         credits_committed = False
+        durable_delivery = (
+            self.settings.durable_update_queue_enabled and self.settings.store_bot_responses
+        )
         try:
             await bot.send_chat_action(message.chat.id, "typing")
 
@@ -339,21 +343,28 @@ class QuestionService:
                 await self._fail_closed(bot, message, question.id, session.id, repo)
                 return
 
-            sent_message = await self._send_answer_parts(bot, message, expert_result.text)
-
+            bot_response = None
             if self.settings.store_bot_responses:
-                await repo.create_bot_response(
+                bot_response = await repo.create_bot_response(
                     session_id=session.id,
                     question_id=question.id,
                     response_text=expert_result.text,
-                    telegram_message_id=sent_message.message_id,
                     timeweb_response_id=expert_result.response_id,
+                    status=("delivery_pending" if durable_delivery else "sent"),
                 )
-            await repo.update_session_last_bot_message(session.id, sent_message.message_id)
+                if durable_delivery:
+                    await repo.enqueue_delivery(
+                        bot_response.id,
+                        question.id,
+                        is_private=is_private,
+                        chat_id=message.chat.id,
+                        reply_to_message_id=message.message_id,
+                        message_thread_id=message.message_thread_id,
+                        text_value=expert_result.text,
+                    )
             if reserved_credits:
                 await self.credit_service.commit(repo, user_id, request_id, reserved_credits)
                 await repo.set_question_credits_charged(question.id, reserved_credits)
-                credits_committed = True
             await repo.update_question_filter_result(
                 question.id,
                 normalized_question=normalized,
@@ -371,7 +382,6 @@ class QuestionService:
                     expert_result.text,
                 )
                 await repo.update_session_summary(session.id, updated_summary)
-                await self._send_feedback_prompt(bot, message.chat.id, question.id)
 
             if self._should_store_cache(
                 is_private=is_private,
@@ -388,6 +398,19 @@ class QuestionService:
                     category=filter_result.category,
                     response_mode=response_mode,
                 )
+
+            if durable_delivery:
+                await repo.session.commit()
+                credits_committed = bool(reserved_credits)
+            else:
+                sent_message = await self._send_answer_parts(bot, message, expert_result.text)
+                if bot_response is not None:
+                    bot_response.telegram_message_id = sent_message.message_id
+                await repo.update_session_last_bot_message(session.id, sent_message.message_id)
+                if reserved_credits:
+                    credits_committed = True
+                if is_private:
+                    await self._send_feedback_prompt(bot, message.chat.id, question.id)
 
             logger.info(
                 "question_answered",
@@ -449,6 +472,22 @@ class QuestionService:
             await bot.send_message(chat_id, "Оцените ответ:", reply_markup=keyboard)
         except TelegramAPIError as exc:
             logger.warning("feedback_prompt_failed", chat_id=chat_id, error=str(exc))
+
+    async def deliver_job(self, bot: Bot, job):
+        source_message = Message(
+            message_id=job.reply_to_message_id or 0,
+            date=1,
+            chat=Chat(
+                id=job.chat_id,
+                type="private" if job.is_private else "supergroup",
+            ),
+            text="",
+            message_thread_id=job.message_thread_id,
+        )
+        sent_message = await self._send_answer_parts(bot, source_message, job.text)
+        if job.is_private:
+            await self._send_feedback_prompt(bot, job.chat_id, job.question_id)
+        return sent_message
 
     async def _store_answer_cache(
         self,

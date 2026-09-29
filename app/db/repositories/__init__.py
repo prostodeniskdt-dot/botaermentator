@@ -21,6 +21,7 @@ from app.db.models.entities import (
     ProcessedUpdate,
     RateLimitCounter,
     SystemSetting,
+    TelegramDeliveryJob,
     TelegramUpdateJob,
     TelegramUser,
     UserFeedback,
@@ -570,20 +571,46 @@ class Repository:
             job.status = "processing"
             job.attempts += 1
             job.locked_at = now
+            job.lease_id = uuid.uuid4()
             job.last_error = None
             await self.session.flush()
         return job
 
-    async def complete_update_job(self, job_id: uuid.UUID) -> None:
-        await self.session.execute(
+    async def heartbeat_update_job(self, job_id: uuid.UUID, lease_id: uuid.UUID) -> bool:
+        result = await self.session.execute(
             update(TelegramUpdateJob)
-            .where(TelegramUpdateJob.id == job_id)
-            .values(status="done", locked_at=None, updated_at=func.now())
+            .where(
+                TelegramUpdateJob.id == job_id,
+                TelegramUpdateJob.status == "processing",
+                TelegramUpdateJob.lease_id == lease_id,
+            )
+            .values(locked_at=datetime.now(UTC), updated_at=func.now())
+            .returning(TelegramUpdateJob.id)
         )
+        return result.scalar_one_or_none() is not None
+
+    async def complete_update_job(self, job_id: uuid.UUID, lease_id: uuid.UUID) -> bool:
+        result = await self.session.execute(
+            update(TelegramUpdateJob)
+            .where(
+                TelegramUpdateJob.id == job_id,
+                TelegramUpdateJob.status == "processing",
+                TelegramUpdateJob.lease_id == lease_id,
+            )
+            .values(
+                status="done",
+                locked_at=None,
+                lease_id=None,
+                updated_at=func.now(),
+            )
+            .returning(TelegramUpdateJob.id)
+        )
+        return result.scalar_one_or_none() is not None
 
     async def fail_update_job(
         self,
         job_id: uuid.UUID,
+        lease_id: uuid.UUID,
         *,
         error: str,
         retry: bool,
@@ -592,13 +619,20 @@ class Repository:
         values = {
             "status": "pending" if retry else "failed",
             "locked_at": None,
+            "lease_id": None,
             "last_error": error[:2000],
             "updated_at": func.now(),
         }
         if retry:
             values["available_at"] = datetime.now(UTC) + timedelta(seconds=retry_delay_seconds)
         await self.session.execute(
-            update(TelegramUpdateJob).where(TelegramUpdateJob.id == job_id).values(**values)
+            update(TelegramUpdateJob)
+            .where(
+                TelegramUpdateJob.id == job_id,
+                TelegramUpdateJob.status == "processing",
+                TelegramUpdateJob.lease_id == lease_id,
+            )
+            .values(**values)
         )
 
     async def get_system_setting(self, key: str, default=None):
@@ -626,6 +660,142 @@ class Repository:
                     "updated_at": func.now(),
                 },
             )
+        )
+
+    # --- Telegram delivery outbox ---
+
+    async def enqueue_delivery(
+        self,
+        bot_response_id: uuid.UUID,
+        question_id: uuid.UUID,
+        *,
+        is_private: bool,
+        chat_id: int,
+        reply_to_message_id: int | None,
+        message_thread_id: int | None,
+        text_value: str,
+    ) -> TelegramDeliveryJob:
+        job = TelegramDeliveryJob(
+            bot_response_id=bot_response_id,
+            question_id=question_id,
+            is_private=is_private,
+            chat_id=chat_id,
+            reply_to_message_id=reply_to_message_id,
+            message_thread_id=message_thread_id,
+            text=text_value,
+        )
+        self.session.add(job)
+        await self.session.flush()
+        return job
+
+    async def claim_delivery_job(
+        self, *, stale_after_seconds: int = 300
+    ) -> TelegramDeliveryJob | None:
+        now = datetime.now(UTC)
+        stale_before = now - timedelta(seconds=stale_after_seconds)
+        result = await self.session.execute(
+            select(TelegramDeliveryJob)
+            .where(
+                or_(
+                    (
+                        (TelegramDeliveryJob.status == "pending")
+                        & (TelegramDeliveryJob.available_at <= now)
+                    ),
+                    (
+                        (TelegramDeliveryJob.status == "processing")
+                        & (TelegramDeliveryJob.locked_at < stale_before)
+                    ),
+                )
+            )
+            .order_by(TelegramDeliveryJob.created_at)
+            .with_for_update(skip_locked=True)
+            .limit(1)
+        )
+        job = result.scalar_one_or_none()
+        if job is not None:
+            job.status = "processing"
+            job.attempts += 1
+            job.locked_at = now
+            job.lease_id = uuid.uuid4()
+            job.last_error = None
+            await self.session.flush()
+        return job
+
+    async def complete_delivery_job(
+        self,
+        job_id: uuid.UUID,
+        lease_id: uuid.UUID,
+        telegram_message_id: int,
+    ) -> bool:
+        result = await self.session.execute(
+            update(TelegramDeliveryJob)
+            .where(
+                TelegramDeliveryJob.id == job_id,
+                TelegramDeliveryJob.status == "processing",
+                TelegramDeliveryJob.lease_id == lease_id,
+            )
+            .values(
+                status="done",
+                locked_at=None,
+                lease_id=None,
+                updated_at=func.now(),
+            )
+            .returning(TelegramDeliveryJob.bot_response_id)
+        )
+        bot_response_id = result.scalar_one_or_none()
+        if bot_response_id is None:
+            return False
+        await self.session.execute(
+            update(BotResponse)
+            .where(BotResponse.id == bot_response_id)
+            .values(telegram_message_id=telegram_message_id, status="sent")
+        )
+        session_result = await self.session.execute(
+            select(BotResponse.session_id).where(BotResponse.id == bot_response_id)
+        )
+        session_id = session_result.scalar_one()
+        await self.update_session_last_bot_message(session_id, telegram_message_id)
+        return True
+
+    async def heartbeat_delivery_job(self, job_id: uuid.UUID, lease_id: uuid.UUID) -> bool:
+        result = await self.session.execute(
+            update(TelegramDeliveryJob)
+            .where(
+                TelegramDeliveryJob.id == job_id,
+                TelegramDeliveryJob.status == "processing",
+                TelegramDeliveryJob.lease_id == lease_id,
+            )
+            .values(locked_at=datetime.now(UTC), updated_at=func.now())
+            .returning(TelegramDeliveryJob.id)
+        )
+        return result.scalar_one_or_none() is not None
+
+    async def fail_delivery_job(
+        self,
+        job_id: uuid.UUID,
+        lease_id: uuid.UUID,
+        *,
+        error: str,
+        retry: bool,
+        retry_delay_seconds: int,
+    ) -> None:
+        values = {
+            "status": "pending" if retry else "failed",
+            "locked_at": None,
+            "lease_id": None,
+            "last_error": error[:2000],
+            "updated_at": func.now(),
+        }
+        if retry:
+            values["available_at"] = datetime.now(UTC) + timedelta(seconds=retry_delay_seconds)
+        await self.session.execute(
+            update(TelegramDeliveryJob)
+            .where(
+                TelegramDeliveryJob.id == job_id,
+                TelegramDeliveryJob.status == "processing",
+                TelegramDeliveryJob.lease_id == lease_id,
+            )
+            .values(**values)
         )
 
     # --- Usage ---
@@ -680,23 +850,58 @@ class Repository:
         *,
         reason: str,
         admin_telegram_user_id: int | None = None,
+        request_id: uuid.UUID | None = None,
     ) -> CreditAccount:
         if amount <= 0:
             raise ValueError("Credit grant must be positive")
         account = await self.get_or_create_credit_account(telegram_user_id)
-        account.balance += amount
-        self.session.add(
-            CreditTransaction(
-                telegram_user_id=telegram_user_id,
-                transaction_type=CreditTransactionType.GRANT,
-                status=CreditTransactionStatus.COMMITTED,
-                amount=amount,
-                balance_after=account.balance,
-                reason=reason,
-                admin_telegram_user_id=admin_telegram_user_id,
+        transaction_id = uuid.uuid4()
+        if request_id is not None:
+            inserted = await self.session.execute(
+                insert(CreditTransaction)
+                .values(
+                    id=transaction_id,
+                    telegram_user_id=telegram_user_id,
+                    request_id=request_id,
+                    transaction_type=CreditTransactionType.GRANT,
+                    status=CreditTransactionStatus.COMMITTED,
+                    amount=amount,
+                    reason=reason,
+                    admin_telegram_user_id=admin_telegram_user_id,
+                )
+                .on_conflict_do_nothing(constraint="uq_credit_request_type")
+                .returning(CreditTransaction.id)
             )
+            if inserted.scalar_one_or_none() is None:
+                await self.session.refresh(account)
+                return account
+        else:
+            self.session.add(
+                CreditTransaction(
+                    id=transaction_id,
+                    telegram_user_id=telegram_user_id,
+                    transaction_type=CreditTransactionType.GRANT,
+                    status=CreditTransactionStatus.COMMITTED,
+                    amount=amount,
+                    reason=reason,
+                    admin_telegram_user_id=admin_telegram_user_id,
+                )
+            )
+            await self.session.flush()
+        result = await self.session.execute(
+            update(CreditAccount)
+            .where(CreditAccount.telegram_user_id == telegram_user_id)
+            .values(balance=CreditAccount.balance + amount, updated_at=func.now())
+            .returning(CreditAccount.balance)
+            .execution_options(synchronize_session=False)
         )
-        await self.session.flush()
+        balance = result.scalar_one()
+        await self.session.execute(
+            update(CreditTransaction)
+            .where(CreditTransaction.id == transaction_id)
+            .values(balance_after=balance)
+        )
+        await self.session.refresh(account)
         return account
 
     async def has_credit_grant_reason(self, telegram_user_id: int, reason: str) -> bool:
@@ -848,17 +1053,26 @@ class Repository:
         *,
         reason: str | None = None,
         comment: str | None = None,
-    ) -> UserFeedback:
-        feedback = UserFeedback(
-            telegram_user_id=telegram_user_id,
-            question_id=question_id,
-            rating=rating,
-            reason=reason,
-            comment=comment,
+    ) -> None:
+        await self.session.execute(
+            insert(UserFeedback)
+            .values(
+                id=uuid.uuid4(),
+                telegram_user_id=telegram_user_id,
+                question_id=question_id,
+                rating=rating,
+                reason=reason,
+                comment=comment,
+            )
+            .on_conflict_do_update(
+                constraint="uq_feedback_user_question",
+                set_={
+                    "rating": rating,
+                    "reason": reason,
+                    "comment": comment,
+                },
+            )
         )
-        self.session.add(feedback)
-        await self.session.flush()
-        return feedback
 
     # --- Rate limits ---
 

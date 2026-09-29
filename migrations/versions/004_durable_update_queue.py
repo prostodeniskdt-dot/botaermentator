@@ -45,6 +45,7 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.Column("locked_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("lease_id", postgresql.UUID(as_uuid=True), nullable=True),
         sa.Column("last_error", sa.Text(), nullable=True),
         sa.Column(
             "created_at",
@@ -78,8 +79,70 @@ def upgrade() -> None:
         "telegram_update_jobs",
         ["status", "available_at"],
     )
+    op.create_table(
+        "telegram_delivery_jobs",
+        sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("bot_response_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("question_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("is_private", sa.Boolean(), server_default=sa.text("false"), nullable=False),
+        sa.Column("chat_id", sa.BigInteger(), nullable=False),
+        sa.Column("reply_to_message_id", sa.BigInteger(), nullable=True),
+        sa.Column("message_thread_id", sa.BigInteger(), nullable=True),
+        sa.Column("text", sa.Text(), nullable=False),
+        sa.Column("status", sa.String(length=32), server_default="pending", nullable=False),
+        sa.Column("attempts", sa.Integer(), server_default="0", nullable=False),
+        sa.Column(
+            "available_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.Column("locked_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("lease_id", postgresql.UUID(as_uuid=True), nullable=True),
+        sa.Column("last_error", sa.Text(), nullable=True),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.ForeignKeyConstraint(["bot_response_id"], ["bot_responses.id"]),
+        sa.ForeignKeyConstraint(["question_id"], ["user_questions.id"]),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("bot_response_id"),
+    )
+    op.create_index(
+        "ix_telegram_delivery_jobs_bot_response_id",
+        "telegram_delivery_jobs",
+        ["bot_response_id"],
+        unique=True,
+    )
+    op.create_index("ix_telegram_delivery_jobs_chat_id", "telegram_delivery_jobs", ["chat_id"])
+    op.create_index(
+        "ix_telegram_delivery_jobs_question_id",
+        "telegram_delivery_jobs",
+        ["question_id"],
+    )
+    op.create_index("ix_telegram_delivery_jobs_status", "telegram_delivery_jobs", ["status"])
+    op.create_index(
+        "ix_telegram_delivery_jobs_available_at",
+        "telegram_delivery_jobs",
+        ["available_at"],
+    )
+    op.create_index(
+        "ix_delivery_jobs_claim",
+        "telegram_delivery_jobs",
+        ["status", "available_at"],
+    )
 
 
 def downgrade() -> None:
+    op.drop_table("telegram_delivery_jobs")
     op.drop_table("telegram_update_jobs")
     op.drop_table("system_settings")

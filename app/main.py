@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from functools import partial
 
 from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject, Update
@@ -54,6 +55,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
 
     bot = None
     dispatcher = None
+    question_service = None
     update_worker = None
     update_worker_task = None
     timeweb_client = TimewebClient(settings)
@@ -132,12 +134,16 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         and settings.database_url
         and bot is not None
         and dispatcher is not None
+        and question_service is not None
     ):
         update_worker = UpdateQueueWorker(
             bot,
             dispatcher,
             poll_interval_seconds=settings.update_queue_poll_seconds,
             max_attempts=settings.update_queue_max_attempts,
+            stale_after_seconds=settings.update_queue_stale_seconds,
+            heartbeat_seconds=settings.update_queue_heartbeat_seconds,
+            delivery_handler=partial(question_service.deliver_job, bot),
         )
         update_worker_task = asyncio.create_task(update_worker.run(), name="telegram-update-queue")
 
