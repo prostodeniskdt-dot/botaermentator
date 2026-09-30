@@ -28,6 +28,9 @@ class CreditService:
         amount = self.cost_for_mode(mode)
         if telegram_user_id in self.settings.admin_user_ids:
             return 0
+        user = await repo.get_user_by_telegram_id(telegram_user_id)
+        if user is not None and user.is_unlimited is True:
+            return 0
         if await repo.reserve_credits(telegram_user_id, request_id, amount):
             return amount
         return None

@@ -129,9 +129,14 @@ async def private_mode(message: Message, settings, bot, access_service) -> None:
 
 @router.message(F.chat.type == "private", Command("balance"))
 async def private_balance(message: Message, settings, bot, access_service) -> None:
-    if not await _active_user(message, settings, bot, access_service):
+    user = await _active_user(message, settings, bot, access_service)
+    if not user:
         return
-    if message.from_user and message.from_user.id in settings.admin_user_ids:
+    if (
+        message.from_user
+        and message.from_user.id in settings.admin_user_ids
+        or user.is_unlimited is True
+    ):
         await _answer(message, BALANCE_UNLIMITED)
         return
     async with session_scope() as db:

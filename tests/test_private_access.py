@@ -106,6 +106,19 @@ async def test_credit_service_skips_reserve_for_admin(settings) -> None:
 
 
 @pytest.mark.asyncio
+async def test_credit_service_skips_reserve_for_unlimited_user(settings) -> None:
+    repo = AsyncMock()
+    repo.get_user_by_telegram_id.return_value = MagicMock(is_unlimited=True)
+    request_id = uuid.uuid4()
+    service = CreditService(settings)
+
+    amount = await service.reserve(repo, 7, request_id, ResponseMode.DEEP)
+
+    assert amount == 0
+    repo.reserve_credits.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_private_context_uses_bounded_history_and_confirmed_facts(settings) -> None:
     service = QuestionService(
         settings,

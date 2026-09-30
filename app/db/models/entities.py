@@ -37,6 +37,7 @@ class TelegramUser(Base):
     profile_facts: Mapped[dict] = mapped_column(JSONB, default=dict)
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     approved_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    is_unlimited: Mapped[bool] = mapped_column(Boolean, default=False)
     is_blocked: Mapped[bool] = mapped_column(Boolean, default=False)
     blocked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     block_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
