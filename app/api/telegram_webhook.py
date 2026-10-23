@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from time import perf_counter
+
 from aiogram.types import Update
 from fastapi import APIRouter, Header, HTTPException, Request, status
 
@@ -35,6 +37,7 @@ def create_webhook_router(settings: Settings | None = None) -> APIRouter:
                 detail="bot not initialized",
             )
 
+        started = perf_counter()
         payload = await request.json()
         update_id = payload.get("update_id")
         if not isinstance(update_id, int):
@@ -47,7 +50,12 @@ def create_webhook_router(settings: Settings | None = None) -> APIRouter:
         if webhook_settings.durable_update_queue_enabled:
             async with session_scope() as db:
                 queued = await Repository(db).enqueue_update_job(update_id, payload)
-            logger.info("telegram_webhook_queued", update_id=update_id, inserted=queued)
+            logger.info(
+                "telegram_webhook_queued",
+                update_id=update_id,
+                inserted=queued,
+                duration_ms=round((perf_counter() - started) * 1000, 2),
+            )
             return {"ok": True}
 
         update = Update.model_validate(payload, context={"bot": bot})

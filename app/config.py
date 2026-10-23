@@ -50,7 +50,9 @@ class Settings(BaseSettings):
 
     timeweb_connect_timeout_seconds: float = 5.0
     timeweb_read_timeout_seconds: float = 120.0
-    timeweb_max_attempts: int = 2
+    timeweb_max_attempts: int = Field(default=2, ge=1, le=5)
+    timeweb_deadline_seconds: float = Field(default=150, gt=0)
+    timeweb_max_http_requests: int = Field(default=6, ge=1, le=20)
 
     user_requests_per_minute: int = 6
     user_requests_per_hour: int = 60
@@ -85,13 +87,22 @@ class Settings(BaseSettings):
     starting_credits: int = 5
     quick_mode_credits: int = 1
     deep_mode_credits: int = 5
-    quick_max_output_tokens: int = 600
-    deep_max_output_tokens: int = 2200
+    quick_max_output_tokens: int = Field(default=600, ge=128, le=16384)
+    deep_max_output_tokens: int = Field(default=2200, ge=128, le=32768)
     private_context_turns: int = 6
     private_memory_max_chars: int = 6000
     knowledge_base_version: str = "1"
-    prompt_version: str = "3"
+    prompt_version: str = "4"
+    answer_expansion_credits: int = Field(default=4, ge=1)
+    recommendations_enabled: bool = True
+    courses_url: str = "https://t.me/ferm2bot"
+    shop_url: str = "https://t.me/AtlasMoldShopBot"
     durable_update_queue_enabled: bool = False
+    update_queue_concurrency: int = Field(default=2, ge=1, le=8)
+    processing_lease_seconds: int = Field(default=300, ge=60)
+    database_pool_size: int = Field(default=5, ge=2)
+    database_max_overflow: int = Field(default=5, ge=0)
+    database_pool_timeout: float = Field(default=10, gt=0)
     update_queue_poll_seconds: float = 0.5
     update_queue_max_attempts: int = 3
     update_queue_stale_seconds: int = 1800

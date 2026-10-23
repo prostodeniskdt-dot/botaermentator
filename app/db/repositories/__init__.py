@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, or_, select, text, update
+from sqlalchemy import delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,6 +13,7 @@ from app.db.models.entities import (
     AccessEvent,
     AIUsageEvent,
     AnswerCache,
+    AnswerExpansion,
     BlockEvent,
     BotResponse,
     ChatSession,
@@ -21,10 +22,13 @@ from app.db.models.entities import (
     ProcessedUpdate,
     RateLimitCounter,
     SystemSetting,
+    TaskNotice,
     TelegramDeliveryJob,
+    TelegramDeliveryPart,
     TelegramUpdateJob,
     TelegramUser,
     UserFeedback,
+    UserProcessingLease,
     UserQuestion,
 )
 from app.domain.enums import (
@@ -37,6 +41,7 @@ from app.domain.enums import (
     ResponseMode,
     SessionStatus,
 )
+from app.services.update_routing import update_lane
 
 
 class Repository:
@@ -44,6 +49,7 @@ class Repository:
 
     def __init__(self, session: AsyncSession) -> None:
         self.session = session
+        self.processing_lease = None
 
     # --- Users ---
 
@@ -139,6 +145,7 @@ class Repository:
         user = await self.get_user_by_telegram_id(telegram_user_id)
         if user is None:
             return None
+        await self.session.refresh(user, with_for_update=True)
         facts = list(user.profile_facts.get("confirmed", []))
         if fact not in facts:
             facts.append(fact)
@@ -171,6 +178,21 @@ class Repository:
         if user is not None:
             user.memory_summary = None
             user.profile_facts = {}
+        await self.session.execute(
+            update(AnswerExpansion)
+            .where(
+                AnswerExpansion.status == "offered",
+                AnswerExpansion.source_response_id.in_(
+                    select(BotResponse.id)
+                    .join(ChatSession, BotResponse.session_id == ChatSession.id)
+                    .where(
+                        ChatSession.telegram_user_id == telegram_user_id,
+                        ChatSession.is_private.is_(True),
+                    )
+                ),
+            )
+            .values(status="invalidated")
+        )
         await self.close_private_sessions(telegram_user_id)
 
     async def set_user_blocked(
@@ -306,7 +328,9 @@ class Repository:
 
     async def update_session_summary(self, session_id: uuid.UUID, summary: str) -> None:
         await self.session.execute(
-            update(ChatSession).where(ChatSession.id == session_id).values(summary=summary)
+            update(ChatSession)
+            .where(ChatSession.id == session_id, ChatSession.closed_at.is_(None))
+            .values(summary=summary)
         )
 
     # --- Questions & responses ---
@@ -385,7 +409,20 @@ class Repository:
             .join(ChatSession, BotResponse.session_id == ChatSession.id)
             .where(
                 ChatSession.chat_id == chat_id,
-                BotResponse.telegram_message_id == telegram_message_id,
+                or_(
+                    BotResponse.telegram_message_id == telegram_message_id,
+                    BotResponse.id.in_(
+                        select(TelegramDeliveryJob.bot_response_id)
+                        .join(
+                            TelegramDeliveryPart,
+                            TelegramDeliveryPart.delivery_job_id == TelegramDeliveryJob.id,
+                        )
+                        .where(
+                            TelegramDeliveryJob.chat_id == chat_id,
+                            TelegramDeliveryPart.telegram_message_id == telegram_message_id,
+                        )
+                    ),
+                ),
             )
             .order_by(BotResponse.created_at.desc())
             .limit(1)
@@ -538,6 +575,7 @@ class Repository:
                 id=uuid.uuid4(),
                 telegram_update_id=telegram_update_id,
                 payload=payload,
+                lane=update_lane(payload),
                 status="pending",
             )
             .on_conflict_do_nothing(index_elements=["telegram_update_id"])
@@ -545,12 +583,15 @@ class Repository:
         )
         return result.scalar_one_or_none() is not None
 
-    async def claim_update_job(self, *, stale_after_seconds: int = 300) -> TelegramUpdateJob | None:
+    async def claim_update_job(
+        self, *, stale_after_seconds: int = 300, lane: str = "question"
+    ) -> TelegramUpdateJob | None:
         now = datetime.now(UTC)
         stale_before = now - timedelta(seconds=stale_after_seconds)
         result = await self.session.execute(
             select(TelegramUpdateJob)
             .where(
+                TelegramUpdateJob.lane == lane,
                 or_(
                     (
                         (TelegramUpdateJob.status == "pending")
@@ -560,7 +601,7 @@ class Repository:
                         (TelegramUpdateJob.status == "processing")
                         & (TelegramUpdateJob.locked_at < stale_before)
                     ),
-                )
+                ),
             )
             .order_by(TelegramUpdateJob.created_at)
             .with_for_update(skip_locked=True)
@@ -1106,6 +1147,9 @@ class Repository:
         return int(result.scalar_one())
 
     async def try_acquire_user_processing_lock(self, telegram_user_id: int) -> bool:
+        if self.processing_lease is not None:
+            await self.ensure_processing_lease()
+            return True
         result = await self.session.execute(
             text("SELECT pg_try_advisory_xact_lock(:lock_id)"),
             {"lock_id": telegram_user_id},
@@ -1151,3 +1195,237 @@ class Repository:
         self.session.add(event)
         await self.session.flush()
         return event
+
+    async def acquire_processing_lease(self, user_id, owner, request_id, seconds):
+        now = datetime.now(UTC)
+        stmt = insert(UserProcessingLease).values(
+            telegram_user_id=user_id,
+            owner=owner,
+            request_id=request_id,
+            expires_at=now + timedelta(seconds=seconds),
+        )
+        result = await self.session.execute(
+            stmt.on_conflict_do_update(
+                index_elements=["telegram_user_id"],
+                set_={
+                    "owner": owner,
+                    "request_id": request_id,
+                    "expires_at": now + timedelta(seconds=seconds),
+                },
+                where=UserProcessingLease.expires_at < now,
+            ).returning(UserProcessingLease.owner)
+        )
+        return result.scalar_one_or_none() == owner
+
+    async def renew_processing_lease(self, user_id, owner, seconds):
+        now = datetime.now(UTC)
+        result = await self.session.execute(
+            update(UserProcessingLease)
+            .where(
+                UserProcessingLease.telegram_user_id == user_id,
+                UserProcessingLease.owner == owner,
+                UserProcessingLease.expires_at > now,
+            )
+            .values(expires_at=now + timedelta(seconds=seconds))
+            .returning(UserProcessingLease.owner)
+        )
+        return result.scalar_one_or_none() == owner
+
+    async def release_processing_lease(self, user_id, owner):
+        await self.session.execute(
+            delete(UserProcessingLease).where(
+                UserProcessingLease.telegram_user_id == user_id, UserProcessingLease.owner == owner
+            )
+        )
+
+    async def ensure_processing_lease(self):
+        if self.processing_lease is None:
+            return
+        user_id, owner = self.processing_lease
+        result = await self.session.execute(
+            select(UserProcessingLease.owner)
+            .where(
+                UserProcessingLease.telegram_user_id == user_id,
+                UserProcessingLease.owner == owner,
+                UserProcessingLease.expires_at > datetime.now(UTC),
+            )
+            .with_for_update()
+        )
+        if result.scalar_one_or_none() != owner:
+            raise RuntimeError("Processing lease lost")
+
+    async def before_external(self):
+        """Finish DB work before waiting on a network service."""
+        await self.ensure_processing_lease()
+        await self.session.commit()
+
+    async def question_by_request(self, request_id):
+        result = await self.session.execute(
+            select(UserQuestion).where(UserQuestion.request_id == request_id)
+        )
+        return result.scalar_one_or_none()
+
+    async def response_for_question(self, question_id):
+        result = await self.session.execute(
+            select(BotResponse)
+            .where(BotResponse.question_id == question_id)
+            .order_by(BotResponse.created_at.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    async def save_notice(self, request_id, chat_id, message_id):
+        await self.session.execute(
+            insert(TaskNotice)
+            .values(
+                request_id=request_id,
+                chat_id=chat_id,
+                message_id=message_id,
+                state="active",
+                attempts=0,
+            )
+            .on_conflict_do_nothing()
+        )
+
+    async def notice_for_request(self, request_id):
+        return await self.session.get(TaskNotice, request_id)
+
+    async def notice_cleanup_candidates(self):
+        live = select(UserProcessingLease.request_id).where(
+            UserProcessingLease.expires_at > datetime.now(UTC)
+        )
+        pending_answers = (
+            select(UserQuestion.request_id)
+            .join(TelegramDeliveryJob, TelegramDeliveryJob.question_id == UserQuestion.id)
+            .where(TelegramDeliveryJob.status.in_(["pending", "processing"]))
+        )
+        result = await self.session.execute(
+            select(TaskNotice)
+            .where(
+                TaskNotice.state.in_(["active", "cleanup"]),
+                TaskNotice.attempts < 5,
+                TaskNotice.request_id.not_in(live),
+                TaskNotice.request_id.not_in(pending_answers),
+            )
+            .limit(100)
+        )
+        return list(result.scalars())
+
+    async def delivery_parts(self, job_id):
+        result = await self.session.execute(
+            select(TelegramDeliveryPart)
+            .where(TelegramDeliveryPart.delivery_job_id == job_id)
+            .order_by(TelegramDeliveryPart.part_index)
+        )
+        return list(result.scalars())
+
+    async def prepare_delivery_parts(self, job_id, parts):
+        for index, (text_value, format_value) in enumerate(parts):
+            await self.session.execute(
+                insert(TelegramDeliveryPart)
+                .values(
+                    id=uuid.uuid4(),
+                    delivery_job_id=job_id,
+                    part_index=index,
+                    text=text_value,
+                    format=format_value,
+                    state="pending",
+                )
+                .on_conflict_do_nothing(constraint="uq_delivery_part")
+            )
+        return await self.delivery_parts(job_id)
+
+    async def delivery_is_owned(self, job_id, lease_id):
+        result = await self.session.execute(
+            select(TelegramDeliveryJob.id)
+            .where(
+                TelegramDeliveryJob.id == job_id,
+                TelegramDeliveryJob.lease_id == lease_id,
+                TelegramDeliveryJob.status == "processing",
+            )
+            .with_for_update()
+        )
+        return result.scalar_one_or_none() is not None
+
+    async def recover_orphaned_questions(self):
+        live = select(UserProcessingLease.request_id).where(
+            UserProcessingLease.expires_at > datetime.now(UTC)
+        )
+        result = await self.session.execute(
+            select(UserQuestion)
+            .where(
+                UserQuestion.status.in_(["pending", "processing"]),
+                UserQuestion.request_id.not_in(live),
+            )
+            .with_for_update(skip_locked=True)
+            .limit(100)
+        )
+        recovered = []
+        for question in result.scalars():
+            session = await self.get_session(question.session_id)
+            reservations = await self.session.execute(
+                select(CreditTransaction).where(
+                    CreditTransaction.request_id == question.request_id,
+                    CreditTransaction.transaction_type == "reservation",
+                    CreditTransaction.status == "pending",
+                )
+            )
+            reservation = reservations.scalar_one_or_none()
+            if reservation is not None:
+                await self.release_credit_reservation(
+                    session.telegram_user_id, question.request_id, reservation.amount
+                )
+            recovered.append((session.chat_id, question.request_id))
+            question.status = "failed"
+            await self.session.execute(
+                update(AnswerExpansion)
+                .where(
+                    AnswerExpansion.question_id == question.id,
+                    AnswerExpansion.status == "processing",
+                )
+                .values(status="failed")
+            )
+        return recovered
+
+    async def set_knowledge_level(self, user_id, level):
+        result = await self.session.execute(
+            select(TelegramUser).where(TelegramUser.telegram_user_id == user_id).with_for_update()
+        )
+        user = result.scalar_one_or_none()
+        if user:
+            # Refresh identity-map data after waiting for a concurrent profile writer.
+            await self.session.refresh(user)
+            user.profile_facts = {**user.profile_facts, "knowledge_level": str(level)}
+            await self.session.flush()
+        return user
+
+    async def expansion_for_response(self, response_id, *, lock=False):
+        stmt = select(AnswerExpansion).where(AnswerExpansion.source_response_id == response_id)
+        if lock:
+            stmt = stmt.with_for_update()
+        return (await self.session.execute(stmt)).scalar_one_or_none()
+
+    async def offer_expansion(self, response_id, cost):
+        await self.session.execute(
+            insert(AnswerExpansion)
+            .values(
+                source_response_id=response_id,
+                request_id=uuid.uuid5(uuid.NAMESPACE_URL, f"answer-expansion:{response_id}"),
+                cost=cost,
+                status="offered",
+            )
+            .on_conflict_do_nothing(index_elements=["source_response_id"])
+        )
+        return await self.expansion_for_response(response_id)
+
+    async def get_bot_response(self, response_id):
+        return await self.session.get(BotResponse, response_id)
+
+    async def current_processing_request(self, user_id):
+        result = await self.session.execute(
+            select(UserProcessingLease.request_id).where(
+                UserProcessingLease.telegram_user_id == user_id,
+                UserProcessingLease.expires_at > datetime.now(UTC),
+            )
+        )
+        return result.scalar_one_or_none()

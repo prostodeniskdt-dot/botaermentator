@@ -22,6 +22,7 @@ from app.domain.messages import (
     USER_BLOCKED,
 )
 from app.services.blocking_service import BlockingService
+from app.services.message_content import clean_question, has_meaningful_text, supports_question
 from app.services.rate_limit_service import RateLimitService
 from app.services.usage_service import UsageService
 
@@ -76,6 +77,12 @@ class RequestGate:
         reply_session_id: object | None = None,
         enforce_allowed_chat: bool = True,
     ) -> GateResult:
+        if not supports_question(message):
+            return GateResult(outcome=GateOutcome.IGNORE)
+        if address.question_text.strip() and not has_meaningful_text(
+            clean_question(address.question_text)
+        ):
+            return GateResult(outcome=GateOutcome.IGNORE)
         if message.from_user is None or message.from_user.is_bot:
             return GateResult(outcome=GateOutcome.REJECT, user_message=EMPTY_QUESTION)
 
@@ -112,7 +119,7 @@ class RequestGate:
         if await self.usage_service.is_budget_exceeded(repo):
             return GateResult(outcome=GateOutcome.REJECT, user_message=BUDGET_EXCEEDED)
 
-        question_text = address.question_text.strip()
+        question_text = clean_question(address.question_text)
         if not question_text:
             await self.blocking_service.add_junk_score(
                 repo, reply_session_id, reason="empty", delta=1

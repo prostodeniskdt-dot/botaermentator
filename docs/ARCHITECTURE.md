@@ -150,3 +150,27 @@ Telegram webhook HTTPS → /telegram/webhook
 | Local transport | Polling | Simpler than tunnels |
 | Prod transport | Webhook | Required by App Platform |
 | HTML | Escape model output | Never trust model markup |
+
+
+## Queue and delivery changes
+
+The update worker now has bounded question consumers, a service-command consumer, a delivery consumer,
+and maintenance. Service commands are explicitly classified at enqueue time; unknown callbacks remain
+on the question lane. Each user has a PostgreSQL processing lease with heartbeat and owner fencing.
+Database work is committed before every external AI call. An interrupted unsaved generation fails
+closed and releases its reservation; a saved answer is delivered without re-generation.
+
+Delivery jobs hold a deterministic plan of independently valid parts. Confirmed part message IDs are
+persisted and used for reply lookup. Long Markdown is rendered to a supported HTML subset and split
+with balanced tags and UTF-16 budgets; short answers can use Rich Messages. Ambiguous sends are
+stopped for investigation instead of replayed automatically. Task notices are independent records,
+deleted after the final confirmed part, with best-effort restart cleanup.
+
+Knowledge level lives in existing profile_facts JSONB, separately from confirmed facts and response
+mode. FAQ keys include level and a new cache namespace; answers using personal facts or conversation
+memory are excluded from the shared FAQ cache. One expansion record per source BotResponse stores
+an immutable price/request identity and points to its own UserQuestion. BotResponse context_snapshot
+freezes the original context for expansion. `/forget` invalidates outstanding offers and cannot be
+undone by a delayed generation writing its summary into a closed session.
+
+See CHANGE_DIAGNOSTICS.md for limits and migration/rollout requirements.

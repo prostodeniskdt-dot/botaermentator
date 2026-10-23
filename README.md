@@ -13,11 +13,13 @@ Production-oriented bot with:
 
 - administrator-approved private access;
 - persistent personal conversations and confirmed profile facts;
-- concise and detailed answer modes;
+- concise and detailed answer modes, optional explanation levels and one paid expansion per Quick answer;
 - internal credits with manual grants (no payment integration);
-- durable PostgreSQL queues for Telegram updates and answer delivery;
+- durable PostgreSQL queues with reserved service-command capacity and per-part answer delivery;
 - group questions through `/ask`, `@mention`, or reply;
 - AI usage, feedback, limits, blocking, and versioned FAQ cache.
+
+User instructions: `docs/USER_GUIDE.md`. Diagnostics, migration notes and validation: `docs/CHANGE_DIAGNOSTICS.md`.
 
 See `docs/IMPLEMENTATION_PLAN.md`, `docs/ARCHITECTURE.md`, and
 `docs/TIMEWEB_SETUP.md`.

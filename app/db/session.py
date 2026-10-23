@@ -4,12 +4,25 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from time import perf_counter
 
+from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import Settings, get_settings
 from app.db.ssl import build_asyncpg_ssl_connect_args
 from app.logging import get_logger
+
+
+class TimedAsyncSession(AsyncSession):
+    async def execute(self, *args, **kwargs):
+        started = perf_counter()
+        await self.connection()
+        get_logger(__name__).info(
+            "db_checkout_timing", duration_ms=round((perf_counter() - started) * 1000, 2)
+        )
+        return await super().execute(*args, **kwargs)
+
 
 _engine = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
@@ -34,8 +47,39 @@ def get_engine(settings: Settings | None = None):
             settings.database_url,
             connect_args=_ssl_connect_args(settings),
             pool_pre_ping=True,
+            hide_parameters=True,
+            pool_size=settings.database_pool_size,
+            max_overflow=settings.database_max_overflow,
+            pool_timeout=settings.database_pool_timeout,
         )
-        _session_factory = async_sessionmaker(_engine, expire_on_commit=False)
+
+        @event.listens_for(_engine.sync_engine, "before_cursor_execute")
+        def before_cursor(conn, cursor, statement, parameters, context, executemany):
+            context._metric_started = perf_counter()
+
+        @event.listens_for(_engine.sync_engine, "after_cursor_execute")
+        def after_cursor(conn, cursor, statement, parameters, context, executemany):
+            get_logger(__name__).info(
+                "db_query_timing",
+                duration_ms=round((perf_counter() - context._metric_started) * 1000, 2),
+            )
+
+        @event.listens_for(_engine.sync_engine, "begin")
+        def transaction_start(conn):
+            conn.info["transaction_started"] = perf_counter()
+
+        def transaction_end(conn):
+            started = conn.info.pop("transaction_started", None)
+            if started is not None:
+                get_logger(__name__).info(
+                    "db_transaction_timing", duration_ms=round((perf_counter() - started) * 1000, 2)
+                )
+
+        event.listen(_engine.sync_engine, "commit", transaction_end)
+        event.listen(_engine.sync_engine, "rollback", transaction_end)
+        _session_factory = async_sessionmaker(
+            _engine, class_=TimedAsyncSession, expire_on_commit=False
+        )
     return _engine
 
 

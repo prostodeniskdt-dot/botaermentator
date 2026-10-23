@@ -37,6 +37,8 @@ class ContextRelationAgent:
         session_id,
         question_id,
     ) -> ContextRelationResult:
+        if len(previous_answer) > 1600:
+            previous_answer = previous_answer[:1000] + "\n…\n" + previous_answer[-600:]
         message = (
             f"{self._prompt}\n\n"
             f"Current question:\n{current_question}\n\n"
@@ -45,6 +47,7 @@ class ContextRelationAgent:
         )
         started = datetime.now(UTC)
         try:
+            await repo.before_external()
             call = await self.client.call_agent(
                 agent_id=self.settings.timeweb_agent_2_id,
                 token=self.settings.timeweb_agent_2_token,
@@ -55,6 +58,7 @@ class ContextRelationAgent:
             if parsed is not None:
                 return parsed
             retry_started = datetime.now(UTC)
+            await repo.before_external()
             retry = await self.client.call_agent(
                 agent_id=self.settings.timeweb_agent_2_id,
                 token=self.settings.timeweb_agent_2_token,
@@ -79,7 +83,7 @@ class ContextRelationAgent:
                 success=False,
                 error_code=getattr(exc, "error_code", "client_error"),
             )
-            logger.warning("agent2_failed_fallback", error=str(exc))
+            logger.warning("agent2_failed_fallback", error_type=type(exc).__name__)
 
         return self._standalone_fallback(current_question)
 
@@ -88,7 +92,7 @@ class ContextRelationAgent:
             parsed = parse_agent_json(text, ContextRelationResult)
             return parsed  # type: ignore[return-value]
         except AgentParseError as exc:
-            logger.warning("agent2_parse_failed", error=str(exc))
+            logger.warning("agent2_parse_failed", error_type=type(exc).__name__)
             return None
 
     @staticmethod
@@ -111,6 +115,7 @@ class ContextRelationAgent:
         success: bool,
         error_code: str | None = None,
     ) -> None:
+        await repo.ensure_processing_lease()
         finished = datetime.now(UTC)
         latency = int((finished - started).total_seconds() * 1000)
         event = AIUsageEvent(

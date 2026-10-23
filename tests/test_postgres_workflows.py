@@ -1,0 +1,629 @@
+"""Real PostgreSQL checks. Set TEST_DATABASE_URL to an isolated disposable database."""
+
+import asyncio
+import os
+import uuid
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
+from aiogram.types import Chat, Message, User
+from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+import app.db.session as sessions
+from app.agents.schemas import ContextRelationResult, IndustryFilterResult, TimewebAgentResponse
+from app.bot.factory import build_services
+from app.config import Settings
+from app.db.base import Base
+from app.db.models.entities import (
+    AnswerExpansion,
+    BotResponse,
+    CreditAccount,
+    CreditTransaction,
+    TaskNotice,
+    TelegramDeliveryPart,
+    TelegramUser,
+    UserProcessingLease,
+    UserQuestion,
+)
+from app.db.repositories import Repository
+from app.services.answer_expansion_service import AnswerExpansionService
+from app.services.update_queue import UpdateQueueWorker
+
+pytestmark = pytest.mark.skipif(
+    not os.getenv("TEST_DATABASE_URL"), reason="Requires isolated TEST_DATABASE_URL"
+)
+
+
+@pytest.fixture
+async def db_factory(monkeypatch):
+    url = os.environ["TEST_DATABASE_URL"]
+    schema = "test_" + uuid.uuid4().hex
+    admin = create_async_engine(url)
+    async with admin.begin() as db:
+        await db.execute(text(f'CREATE SCHEMA "{schema}"'))
+    engine = create_async_engine(url, connect_args={"server_settings": {"search_path": schema}})
+    async with engine.begin() as db:
+        await db.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    monkeypatch.setattr(sessions, "_engine", engine)
+    monkeypatch.setattr(sessions, "_session_factory", factory)
+    yield factory
+    await engine.dispose()
+    async with admin.begin() as db:
+        await db.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+    await admin.dispose()
+
+
+@pytest.fixture
+def service():
+    settings = Settings(
+        _env_file=None,
+        allowed_chat_id=-100999,
+        durable_update_queue_enabled=True,
+        user_requests_per_minute=100,
+        answer_cache_enabled=False,
+    )
+    industry = AsyncMock()
+    industry.evaluate.return_value = IndustryFilterResult(
+        allowed=True,
+        category="fermentation",
+        confidence=1,
+        reason_code="relevant",
+        normalized_question="Как хранить закваску?",
+    )
+    context = AsyncMock()
+    context.evaluate.return_value = ContextRelationResult(
+        relation="related",
+        include_previous_context=True,
+        rewritten_question="Как хранить закваску?",
+        confidence=1,
+    )
+    expert = AsyncMock()
+
+    async def answer(repo, **kwargs):
+        await repo.before_external()
+        assert not repo.session.in_transaction()
+        return TimewebAgentResponse(
+            text="\n\n".join(f"Шаг {i}: Практический ответ с параметрами." for i in range(300))
+        )
+
+    expert.answer.side_effect = answer
+    return build_services(
+        settings, industry_filter=industry, context_relation=context, main_expert=expert
+    )[0]
+
+
+def bot_mock():
+    bot = AsyncMock()
+    counter = iter(range(100, 10000))
+
+    async def send(**kwargs):
+        return SimpleNamespace(message_id=next(counter))
+
+    bot.send_message.side_effect = send
+    bot.send_rich_message.side_effect = send
+    return bot
+
+
+async def add_user(factory, user_id=7, balance=50, profile=None, unlimited=False):
+    async with factory.begin() as db:
+        db.add(
+            TelegramUser(
+                telegram_user_id=user_id,
+                access_status="active",
+                profile_facts=profile or {},
+                is_unlimited=unlimited,
+            )
+        )
+        db.add(CreditAccount(telegram_user_id=user_id, balance=balance, reserved=0))
+
+
+def private_message(user_id=7):
+    return Message(
+        message_id=10,
+        date=1,
+        chat=Chat(id=user_id, type="private"),
+        from_user=User(id=user_id, is_bot=False, first_name="Test"),
+        text="Как хранить закваску?",
+    )
+
+
+async def ask(factory, service, bot, user_id=7, update_id=1, mode="quick"):
+    async with factory() as db:
+        await service.handle_private_message(
+            Repository(db),
+            bot,
+            private_message(user_id),
+            update_id=update_id,
+            bot_username="bot",
+            bot_id=999,
+            response_mode=mode,
+            question_text="Как хранить закваску?",
+        )
+
+
+async def claim_delivery(factory):
+    async with factory.begin() as db:
+        return await Repository(db).claim_delivery_job()
+
+
+async def finish_delivery(factory, service, bot, job):
+    sent = await service.deliver_job(bot, job)
+    async with factory.begin() as db:
+        await Repository(db).complete_delivery_job(job.id, job.lease_id, sent.message_id)
+
+
+async def test_multichunk_notice_deleted_after_final_part(db_factory, service):
+    await add_user(db_factory)
+    bot = bot_mock()
+    events = []
+
+    async def send(**kwargs):
+        events.append(("send", kwargs["text"]))
+        return SimpleNamespace(message_id=len(events))
+
+    async def delete(**kwargs):
+        events.append(("delete", kwargs["message_id"]))
+
+    bot.send_message.side_effect = send
+    bot.delete_message.side_effect = delete
+    await ask(db_factory, service, bot)
+    assert not bot.delete_message.called
+    job = await claim_delivery(db_factory)
+    await finish_delivery(db_factory, service, bot, job)
+    assert events[-1][0] == "delete"
+    assert len([e for e in events if e[0] == "send"]) >= 4
+    async with db_factory() as db:
+        account = (await db.execute(select(CreditAccount))).scalar_one()
+        assert (account.balance, account.reserved) == (49, 0)
+        parts = (await db.execute(select(TelegramDeliveryPart))).scalars().all()
+        assert all(p.state == "sent" for p in parts)
+        assert (await db.execute(select(TaskNotice))).scalar_one().state == "deleted"
+        response = (await db.execute(select(BotResponse))).scalar_one()
+        assert await Repository(db).find_bot_response_by_message(7, parts[-1].telegram_message_id)
+        assert response.status == "sent"
+
+
+async def test_delete_failure_does_not_break_delivery(db_factory, service):
+    await add_user(db_factory)
+    bot = bot_mock()
+    bot.delete_message.side_effect = TelegramBadRequest(
+        method=AsyncMock(), message="can't be deleted"
+    )
+    await ask(db_factory, service, bot)
+    await finish_delivery(db_factory, service, bot, await claim_delivery(db_factory))
+    async with db_factory() as db:
+        assert (await db.execute(select(TaskNotice))).scalar_one().state == "unavailable"
+        assert (await db.execute(select(CreditAccount))).scalar_one().balance == 49
+
+
+async def test_repeated_expansion_charges_once_and_keeps_source_context(db_factory, service):
+    await add_user(
+        db_factory, profile={"knowledge_level": "professional", "confirmed": ["Партия 10 л"]}
+    )
+    bot = bot_mock()
+    await ask(db_factory, service, bot)
+    await finish_delivery(db_factory, service, bot, await claim_delivery(db_factory))
+    async with db_factory() as db:
+        source = (await db.execute(select(BotResponse))).scalar_one()
+    expansion = AnswerExpansionService(service)
+    assert "не найден" in await expansion.expand(bot, source.id, 8, 8)
+    assert "Готовлю" in await expansion.expand(bot, source.id, 7, 7)
+    assert "уже" in await expansion.expand(bot, source.id, 7, 7)
+    assert service.main_expert.answer.await_count == 2
+    kwargs = service.main_expert.answer.await_args.kwargs
+    assert kwargs["knowledge_level"] == "professional"
+    assert kwargs["expansion_of"] == source.response_text
+    async with db_factory() as db:
+        account = (await db.execute(select(CreditAccount))).scalar_one()
+        assert (account.balance, account.reserved) == (45, 0)
+        charges = (
+            (
+                await db.execute(
+                    select(CreditTransaction).where(CreditTransaction.transaction_type == "charge")
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert sorted(t.amount for t in charges) == [-4, -1]
+
+
+@pytest.mark.parametrize("balance,fail", [(1, False), (50, True)])
+async def test_expansion_insufficient_or_generation_error_releases_reserve(
+    db_factory, service, balance, fail
+):
+    await add_user(db_factory, balance=balance)
+    bot = bot_mock()
+    await ask(db_factory, service, bot)
+    await finish_delivery(db_factory, service, bot, await claim_delivery(db_factory))
+    async with db_factory() as db:
+        source = (await db.execute(select(BotResponse))).scalar_one()
+    if fail:
+        service.main_expert.answer.side_effect = None
+        service.main_expert.answer.return_value = None
+    status = await AnswerExpansionService(service).expand(bot, source.id, 7, 7)
+    assert ("Не удалось" if fail else "Недостаточно") in status
+    async with db_factory() as db:
+        account = (await db.execute(select(CreditAccount))).scalar_one()
+        assert (account.balance, account.reserved) == (balance - 1, 0)
+
+
+async def test_lease_cross_connection_and_expiry_fencing(db_factory):
+    request, owner = uuid.uuid4(), uuid.uuid4()
+    async with db_factory.begin() as db:
+        assert await Repository(db).acquire_processing_lease(7, owner, request, 60)
+    async with db_factory.begin() as db:
+        assert not await Repository(db).acquire_processing_lease(7, uuid.uuid4(), uuid.uuid4(), 60)
+        await db.execute(
+            text("UPDATE user_processing_leases SET expires_at = now() - interval '1 second'")
+        )
+    new_owner = uuid.uuid4()
+    async with db_factory.begin() as db:
+        assert await Repository(db).acquire_processing_lease(7, new_owner, uuid.uuid4(), 60)
+    async with db_factory.begin() as db:
+        repo = Repository(db)
+        repo.processing_lease = (7, owner)
+        with pytest.raises(RuntimeError, match="lease lost"):
+            await repo.ensure_processing_lease()
+        await repo.release_processing_lease(7, owner)
+    async with db_factory() as db:
+        assert (await db.execute(select(UserProcessingLease))).scalar_one().owner == new_owner
+
+
+async def test_queue_two_questions_do_not_delay_balance(db_factory):
+    bot = bot_mock()
+    started = {1: asyncio.Event(), 2: asyncio.Event(), 3: asyncio.Event()}
+    release = asyncio.Event()
+    dispatcher = AsyncMock()
+
+    async def dispatch(bot, update):
+        started[update.update_id].set()
+        if update.update_id < 3:
+            await release.wait()
+
+    dispatcher.feed_update.side_effect = dispatch
+    async with db_factory.begin() as db:
+        repo = Repository(db)
+        for i in (1, 2, 3):
+            await repo.enqueue_update_job(
+                i,
+                {
+                    "update_id": i,
+                    "message": {
+                        "message_id": i,
+                        "date": 1,
+                        "chat": {"id": i, "type": "private"},
+                        "from": {"id": i, "is_bot": False, "first_name": "Test"},
+                        "text": "/balance" if i == 3 else "long question",
+                    },
+                },
+            )
+    worker = UpdateQueueWorker(
+        bot,
+        dispatcher,
+        poll_interval_seconds=0.01,
+        max_attempts=3,
+        stale_after_seconds=60,
+        heartbeat_seconds=10,
+        delivery_handler=AsyncMock(),
+        concurrency=2,
+    )
+    task = asyncio.create_task(worker.run())
+    try:
+        await asyncio.wait_for(asyncio.gather(*(e.wait() for e in started.values())), timeout=3)
+        assert not release.is_set()
+    finally:
+        release.set()
+        worker.stop()
+        await asyncio.wait_for(task, timeout=3)
+
+
+async def test_delivery_retry_skips_confirmed_parts(db_factory, service):
+    await add_user(db_factory)
+    bot = bot_mock()
+    await ask(db_factory, service, bot)
+    job = await claim_delivery(db_factory)
+    bot.send_message.side_effect = [
+        SimpleNamespace(message_id=200),
+        TelegramBadRequest(method=AsyncMock(), message="synthetic reject"),
+    ]
+    with pytest.raises(TelegramBadRequest):
+        await service.deliver_job(bot, job)
+    async with db_factory.begin() as db:
+        await Repository(db).fail_delivery_job(
+            job.id, job.lease_id, error="test", retry=True, retry_delay_seconds=0
+        )
+    bot.send_message.reset_mock()
+    bot.send_message.side_effect = None
+    bot.send_message.return_value = SimpleNamespace(message_id=201)
+    await finish_delivery(db_factory, service, bot, await claim_delivery(db_factory))
+    async with db_factory() as db:
+        parts = await Repository(db).delivery_parts(job.id)
+        assert parts[0].telegram_message_id == 200
+        assert bot.send_message.await_count == len(parts) - 1
+
+
+async def test_ambiguous_delivery_is_not_replayed(db_factory, service):
+    from app.services.delivery_service import DeliveryUnknownError
+
+    await add_user(db_factory)
+    bot = bot_mock()
+    await ask(db_factory, service, bot)
+    job = await claim_delivery(db_factory)
+    bot.send_message.side_effect = TelegramNetworkError(method=AsyncMock(), message="timeout")
+    with pytest.raises(DeliveryUnknownError):
+        await service.deliver_job(bot, job)
+    count = bot.send_message.await_count
+    with pytest.raises(DeliveryUnknownError):
+        await service.deliver_job(bot, job)
+    assert bot.send_message.await_count == count
+
+
+async def test_restart_orphan_reservation_and_notice_cleanup(db_factory, service):
+    await add_user(db_factory)
+    bot = bot_mock()
+    request_id = uuid.uuid4()
+    async with db_factory.begin() as db:
+        repo = Repository(db)
+        session = await repo.create_session(
+            chat_id=7,
+            telegram_user_id=7,
+            message_thread_id=None,
+            root_user_message_id=1,
+            is_private=True,
+        )
+        question = await repo.create_question(
+            session_id=session.id, raw_question="interrupted", request_id=request_id
+        )
+        await repo.reserve_credits(7, request_id, 5)
+        await repo.save_notice(request_id, 7, 99)
+    await service.notifications.cleanup(bot)
+    await service.notifications.cleanup(bot)
+    async with db_factory() as db:
+        account = (await db.execute(select(CreditAccount))).scalar_one()
+        assert (account.balance, account.reserved) == (50, 0)
+        assert (await db.get(UserQuestion, question.id)).status == "failed"
+        releases = (
+            (
+                await db.execute(
+                    select(CreditTransaction).where(CreditTransaction.transaction_type == "release")
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(releases) == 1
+    bot.delete_message.assert_awaited_once()
+
+
+async def test_cache_isolated_by_level_and_personal_facts(db_factory, service):
+    service.settings.answer_cache_enabled = True
+    for user_id, level, facts in (
+        (7, "beginner", []),
+        (8, "professional", []),
+        (9, "beginner", []),
+        (10, "beginner", ["Партия 10 л"]),
+    ):
+        await add_user(
+            db_factory, user_id=user_id, profile={"knowledge_level": level, "confirmed": facts}
+        )
+    bot = bot_mock()
+    for update_id, user_id in enumerate((7, 8, 9, 10), 1):
+        await ask(db_factory, service, bot, user_id=user_id, update_id=update_id)
+    assert service.main_expert.answer.await_count == 3
+    assert [
+        call.kwargs["knowledge_level"] for call in service.main_expert.answer.await_args_list
+    ] == ["beginner", "professional", "beginner"]
+    async with db_factory() as db:
+        accounts = {
+            a.telegram_user_id: a for a in (await db.execute(select(CreditAccount))).scalars()
+        }
+        assert accounts[9].balance == 50  # Preserve the existing free FAQ-cache behavior.
+        assert accounts[10].balance == 49
+        assert len((await db.execute(select(UserQuestion))).scalars().all()) == 4
+
+
+async def test_profile_updates_preserve_facts_and_forget_resets_level(db_factory):
+    from app.services.knowledge_level import knowledge_level
+
+    await add_user(db_factory)
+
+    async def set_level():
+        async with db_factory.begin() as db:
+            await Repository(db).set_knowledge_level(7, "advanced")
+
+    async def add_fact():
+        async with db_factory.begin() as db:
+            await Repository(db).add_user_profile_fact(7, "Партия 10 л")
+
+    await asyncio.gather(set_level(), add_fact())
+    async with db_factory.begin() as db:
+        repo = Repository(db)
+        user = await repo.get_user_by_telegram_id(7)
+        assert user.profile_facts == {"knowledge_level": "advanced", "confirmed": ["Партия 10 л"]}
+        for level in ("beginner", "advanced", "professional"):
+            await repo.set_knowledge_level(7, level)
+            assert knowledge_level(user.profile_facts) == level
+        await repo.clear_user_memory(7)
+        assert knowledge_level(user.profile_facts) == "default"
+
+
+@pytest.mark.parametrize("user_id,unlimited", [(42, False), (7, True)])
+async def test_unlimited_and_admin_expansion_no_charges(db_factory, service, user_id, unlimited):
+    service.settings.admin_user_ids = [42]
+    await add_user(db_factory, user_id=user_id, balance=0, unlimited=unlimited)
+    bot = bot_mock()
+    await ask(db_factory, service, bot, user_id=user_id)
+    await finish_delivery(db_factory, service, bot, await claim_delivery(db_factory))
+    async with db_factory() as db:
+        source = (await db.execute(select(BotResponse))).scalar_one()
+    assert "Готовлю" in await AnswerExpansionService(service).expand(
+        bot, source.id, user_id, user_id
+    )
+    async with db_factory() as db:
+        account = (await db.execute(select(CreditAccount))).scalar_one()
+        assert (account.balance, account.reserved) == (0, 0)
+        assert not (await db.execute(select(CreditTransaction))).scalars().all()
+
+
+async def test_simultaneous_expansion_clicks_generate_once(db_factory, service):
+    await add_user(db_factory)
+    bot = bot_mock()
+    await ask(db_factory, service, bot)
+    await finish_delivery(db_factory, service, bot, await claim_delivery(db_factory))
+    async with db_factory() as db:
+        source = (await db.execute(select(BotResponse))).scalar_one()
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def answer(repo, **kwargs):
+        await repo.before_external()
+        started.set()
+        await release.wait()
+        return TimewebAgentResponse(text="Дополнительные полезные сведения.")
+
+    service.main_expert.answer.side_effect = answer
+    expansion = AnswerExpansionService(service)
+    first = asyncio.create_task(expansion.expand(bot, source.id, 7, 7))
+    try:
+        await asyncio.wait_for(started.wait(), 3)
+        assert "Дождитесь" in await expansion.expand(bot, source.id, 7, 7)
+    finally:
+        release.set()
+    assert "Готовлю" in await first
+    assert service.main_expert.answer.await_count == 2
+    async with db_factory() as db:
+        assert (await db.execute(select(CreditAccount))).scalar_one().balance == 45
+
+
+async def test_forget_during_generation_does_not_restore_memory(db_factory, service):
+    await add_user(
+        db_factory, profile={"knowledge_level": "professional", "confirmed": ["Партия 10 л"]}
+    )
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def answer(repo, **kwargs):
+        await repo.before_external()
+        started.set()
+        await release.wait()
+        return TimewebAgentResponse(text="Ответ после очистки памяти.")
+
+    service.main_expert.answer.side_effect = answer
+    bot = bot_mock()
+    task = asyncio.create_task(ask(db_factory, service, bot))
+    try:
+        await asyncio.wait_for(started.wait(), 3)
+        async with db_factory.begin() as db:
+            await Repository(db).clear_user_memory(7)
+    finally:
+        release.set()
+    await task
+    await finish_delivery(db_factory, service, bot, await claim_delivery(db_factory))
+    async with db_factory() as db:
+        repo = Repository(db)
+        user = await repo.get_user_by_telegram_id(7)
+        assert user.profile_facts == {}
+        assert await repo.get_active_private_session(7) is None
+        assert not (await db.execute(select(AnswerExpansion))).scalars().all()
+
+
+async def test_replay_after_interruption_during_context_classification(db_factory, service):
+    await add_user(db_factory)
+    service.settings.duplicate_window_seconds = 0
+    bot = bot_mock()
+    await ask(db_factory, service, bot)
+    started = asyncio.Event()
+
+    async def context(repo, **kwargs):
+        await repo.before_external()
+        started.set()
+        await asyncio.Event().wait()
+
+    service.context_relation.evaluate.side_effect = context
+    task = asyncio.create_task(ask(db_factory, service, bot, update_id=2))
+    await asyncio.wait_for(started.wait(), 3)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await ask(db_factory, service, bot, update_id=2)
+    assert service.main_expert.answer.await_count == 1
+    async with db_factory() as db:
+        questions = (
+            (await db.execute(select(UserQuestion).order_by(UserQuestion.created_at)))
+            .scalars()
+            .all()
+        )
+        assert [q.status for q in questions] == ["answered", "failed"]
+        account = (await db.execute(select(CreditAccount))).scalar_one()
+        assert (account.balance, account.reserved) == (49, 0)
+
+
+async def test_two_users_generate_without_holding_db_while_third_reads_balance(db_factory, service):
+    for user_id in (7, 8, 9):
+        await add_user(db_factory, user_id)
+    started = [asyncio.Event(), asyncio.Event()]
+    release = asyncio.Event()
+    count = 0
+
+    async def answer(repo, **kwargs):
+        nonlocal count
+        await repo.before_external()
+        assert not repo.session.in_transaction()
+        index = count
+        count += 1
+        started[index].set()
+        await release.wait()
+        return TimewebAgentResponse(text="Полный полезный ответ.")
+
+    service.main_expert.answer.side_effect = answer
+    bot = bot_mock()
+    tasks = [
+        asyncio.create_task(ask(db_factory, service, bot, user_id=u, update_id=u)) for u in (7, 8)
+    ]
+    try:
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in started)), 3)
+
+        async def balance():
+            async with db_factory() as db:
+                return await Repository(db).get_or_create_credit_account(9)
+
+        account = await asyncio.wait_for(balance(), 3)
+        assert account.balance - account.reserved == 50
+        assert not release.is_set()
+        assert all(not task.done() for task in tasks)
+    finally:
+        release.set()
+        await asyncio.gather(*tasks)
+
+
+async def test_concurrent_update_rejection_is_idempotent(db_factory, service):
+    await add_user(db_factory)
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def answer(repo, **kwargs):
+        await repo.before_external()
+        started.set()
+        await release.wait()
+        return TimewebAgentResponse(text="Завершённый ответ.")
+
+    service.main_expert.answer.side_effect = answer
+    bot = bot_mock()
+    first = asyncio.create_task(ask(db_factory, service, bot, update_id=1))
+    try:
+        await asyncio.wait_for(started.wait(), 3)
+        await ask(db_factory, service, bot, update_id=1)  # Same-update replay is silent.
+        await ask(
+            db_factory, service, bot, update_id=2
+        )  # A different concurrent question is rejected.
+    finally:
+        release.set()
+    await first
+    await ask(db_factory, service, bot, update_id=2)
+    assert service.main_expert.answer.await_count == 1
+    async with db_factory() as db:
+        assert len((await db.execute(select(UserQuestion))).scalars().all()) == 1
+        account = (await db.execute(select(CreditAccount))).scalar_one()
+        assert (account.balance, account.reserved) == (49, 0)
