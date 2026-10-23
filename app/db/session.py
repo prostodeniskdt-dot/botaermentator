@@ -13,14 +13,22 @@ from app.config import Settings, get_settings
 from app.db.ssl import build_asyncpg_ssl_connect_args
 from app.logging import get_logger
 
+_SLOW_DB_OPERATION_MS = 100
+
+
+def _log_timing(event_name: str, started: float) -> None:
+    duration_ms = (perf_counter() - started) * 1000
+    logger = get_logger(__name__)
+    # Frequent queue polls must not evict request/agent events from bounded logs.
+    log = logger.info if duration_ms >= _SLOW_DB_OPERATION_MS else logger.debug
+    log(event_name, duration_ms=round(duration_ms, 2))
+
 
 class TimedAsyncSession(AsyncSession):
     async def execute(self, *args, **kwargs):
         started = perf_counter()
         await self.connection()
-        get_logger(__name__).info(
-            "db_checkout_timing", duration_ms=round((perf_counter() - started) * 1000, 2)
-        )
+        _log_timing("db_checkout_timing", started)
         return await super().execute(*args, **kwargs)
 
 
@@ -59,10 +67,7 @@ def get_engine(settings: Settings | None = None):
 
         @event.listens_for(_engine.sync_engine, "after_cursor_execute")
         def after_cursor(conn, cursor, statement, parameters, context, executemany):
-            get_logger(__name__).info(
-                "db_query_timing",
-                duration_ms=round((perf_counter() - context._metric_started) * 1000, 2),
-            )
+            _log_timing("db_query_timing", context._metric_started)
 
         @event.listens_for(_engine.sync_engine, "begin")
         def transaction_start(conn):
@@ -71,9 +76,7 @@ def get_engine(settings: Settings | None = None):
         def transaction_end(conn):
             started = conn.info.pop("transaction_started", None)
             if started is not None:
-                get_logger(__name__).info(
-                    "db_transaction_timing", duration_ms=round((perf_counter() - started) * 1000, 2)
-                )
+                _log_timing("db_transaction_timing", started)
 
         event.listen(_engine.sync_engine, "commit", transaction_end)
         event.listen(_engine.sync_engine, "rollback", transaction_end)
