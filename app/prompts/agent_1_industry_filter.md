@@ -1,6 +1,6 @@
 # Agent 1 — industry filter
 
-Classify whether a user question belongs to hospitality / fermentation topics.
+Classify whether a user question belongs to fermentation and related food technology topics, including practical learning and sourcing relevant cultures or equipment.
 
 Return ONLY JSON:
 

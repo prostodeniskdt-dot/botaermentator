@@ -38,6 +38,7 @@ class IndustryFilterAgent:
         message = f"{self._prompt}\n\nUser question:\n{question}"
         started = datetime.now(UTC)
         try:
+            await repo.before_external()
             call = await self.client.call_agent(
                 agent_id=self.settings.timeweb_agent_1_id,
                 token=self.settings.timeweb_agent_1_token,
@@ -48,6 +49,7 @@ class IndustryFilterAgent:
             if parsed is not None:
                 return parsed
             retry_started = datetime.now(UTC)
+            await repo.before_external()
             retry = await self.client.call_agent(
                 agent_id=self.settings.timeweb_agent_1_id,
                 token=self.settings.timeweb_agent_1_token,
@@ -71,7 +73,7 @@ class IndustryFilterAgent:
                 success=False,
                 error_code=getattr(exc, "error_code", "client_error"),
             )
-            logger.error("agent1_failed", error=str(exc))
+            logger.error("agent1_failed", error_type=type(exc).__name__)
             return None
 
     def _parse(self, text: str) -> IndustryFilterResult | None:
@@ -79,7 +81,7 @@ class IndustryFilterAgent:
             parsed = parse_agent_json(text, IndustryFilterResult)
             return parsed  # type: ignore[return-value]
         except AgentParseError as exc:
-            logger.error("agent1_parse_failed", error=str(exc))
+            logger.error("agent1_parse_failed", error_type=type(exc).__name__)
             return None
 
     async def _record_usage(
@@ -93,6 +95,7 @@ class IndustryFilterAgent:
         success: bool,
         error_code: str | None = None,
     ) -> None:
+        await repo.ensure_processing_lease()
         finished = datetime.now(UTC)
         latency = int((finished - started).total_seconds() * 1000)
         event = AIUsageEvent(

@@ -8,6 +8,8 @@ from enum import StrEnum
 
 from aiogram.types import Message
 
+from app.services.message_content import clean_question, supports_question
+
 _ASK_COMMAND_RE = re.compile(r"^/ask(?:@\w+)?(?:\s|$)", re.IGNORECASE)
 
 
@@ -24,14 +26,14 @@ class AddressInfo:
 
 
 def is_bot_mentioned(message: Message, bot_username: str) -> bool:
-    text = message.text or message.caption or ""
+    text = message.text or ""
     if not text or not message.entities:
         return False
     target = bot_username.lower().lstrip("@")
     for entity in message.entities:
         if entity.type != "mention":
             continue
-        mention = text[entity.offset : entity.offset + entity.length]
+        mention = entity.extract_from(text)
         if mention.lower().lstrip("@") == target:
             return True
     return False
@@ -50,35 +52,20 @@ def is_reply_to_bot(message: Message, bot_id: int) -> bool:
 
 
 def extract_question(message: Message, bot_username: str) -> str:
-    text = (message.text or message.caption or "").strip()
+    text = message.text or ""
     if is_ask_command(message):
-        cleaned = _ASK_COMMAND_RE.sub("", text, count=1).strip()
-        return cleaned
-
-    if message.entities:
-        parts: list[str] = []
-        last = 0
-        target = bot_username.lower().lstrip("@")
-        for entity in sorted(message.entities, key=lambda item: item.offset):
-            if entity.type == "mention":
-                mention = text[entity.offset : entity.offset + entity.length]
-                if mention.lower().lstrip("@") == target:
-                    parts.append(text[last : entity.offset])
-                    last = entity.offset + entity.length
-            elif entity.type == "bot_command" and text[
-                entity.offset : entity.offset + entity.length
-            ].lower().startswith("/ask"):
-                parts.append(text[last : entity.offset])
-                last = entity.offset + entity.length
-        parts.append(text[last:])
-        return " ".join(part.strip() for part in parts if part.strip())
-
-    return text
+        return clean_question(_ASK_COMMAND_RE.sub("", text.strip(), count=1))
+    encoded = text.encode("utf-16-le")
+    target = bot_username.lower().lstrip("@")
+    for entity in sorted(message.entities or [], key=lambda item: item.offset, reverse=True):
+        if entity.type == "mention" and entity.extract_from(text).lower().lstrip("@") == target:
+            start, end = entity.offset * 2, (entity.offset + entity.length) * 2
+            encoded = encoded[:start] + encoded[end:]
+    return clean_question(encoded.decode("utf-16-le"))
 
 
 def detect_address(message: Message, *, bot_username: str, bot_id: int) -> AddressInfo | None:
-    text = message.text or message.caption
-    if not text:
+    if not supports_question(message):
         return None
 
     if is_reply_to_bot(message, bot_id):

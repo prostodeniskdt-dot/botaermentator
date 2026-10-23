@@ -8,30 +8,41 @@ from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.types import (
-    Chat,
     InputRichMessage,
     Message,
     ReplyParameters,
 )
+from structlog.contextvars import bound_contextvars
 
 from app.agents.context_relation import ContextRelationAgent
 from app.agents.industry_filter import IndustryFilterAgent
 from app.agents.main_expert import MainExpertAgent
-from app.bot.formatting.telegram_html import format_response_html, split_html_message
-from app.bot.formatting.telegram_rich import prep_rich_markdown, split_rich_message
+from app.bot.formatting.telegram_html import format_response_html
 from app.bot.keyboards import private_menu_keyboard
 from app.bot.mention import AddressKind
 from app.config import Settings
-from app.db.models.entities import AnswerCache
 from app.db.repositories import Repository
-from app.domain.enums import ContextRelation, QuestionStatus, ResponseMode
-from app.domain.messages import AGENT_ERROR, INSUFFICIENT_CREDITS, OFF_TOPIC
+from app.domain.enums import QuestionStatus, ResponseMode
+from app.domain.messages import (
+    AGENT_ERROR,
+    CONCURRENT_REQUEST,
+    INSUFFICIENT_CREDITS,
+    OFF_TOPIC,
+    credit_word,
+)
 from app.logging import get_logger
 from app.services.answer_cache import normalize_question_key
 from app.services.blocking_service import BlockingService
 from app.services.credit_service import CreditService
+from app.services.delivery_service import DeliveryService, delivery_plan
+from app.services.knowledge_level import knowledge_level
+from app.services.message_content import clean_question, has_meaningful_text, supports_question
+from app.services.metrics import stage
+from app.services.processing_lease import processing_lease
+from app.services.recommendations import recommend
 from app.services.request_gate import GateOutcome, RequestGate
 from app.services.session_service import SessionService
+from app.services.task_notification_service import TaskNotificationService
 
 logger = get_logger(__name__)
 
@@ -58,6 +69,8 @@ class QuestionService:
         self.context_relation = context_relation
         self.main_expert = main_expert
         self.credit_service = credit_service or CreditService(settings)
+        self.notifications = TaskNotificationService()
+        self.delivery = DeliveryService(self)
 
     async def handle_group_message(
         self,
@@ -110,28 +123,84 @@ class QuestionService:
             response_mode=response_mode,
         )
 
-    async def _handle_message(
+    async def _handle_message(self, repo, bot, message, **kwargs):
+        if not supports_question(message):
+            return
+        raw_question = kwargs["address"].question_text
+        if raw_question.strip() and not has_meaningful_text(clean_question(raw_question)):
+            return
+        if message.from_user is None or message.from_user.is_bot:
+            return
+        request_id = uuid.uuid5(
+            uuid.NAMESPACE_URL, f"telegram:{kwargs['bot_id']}:{kwargs['update_id']}"
+        )
+        async with processing_lease(
+            repo, message.from_user.id, request_id, seconds=self.settings.processing_lease_seconds
+        ) as acquired:
+            if not acquired:
+                # Do not race the original copy of this same update to its gate marker.
+                active_request = await repo.current_processing_request(message.from_user.id)
+                if active_request == request_id:
+                    await repo.session.commit()
+                    return
+                fresh = await repo.try_mark_update_processed(kwargs["update_id"])
+                await repo.session.commit()
+                if fresh:
+                    await self._reply_text(bot, message, CONCURRENT_REQUEST)
+                return
+            try:
+                with bound_contextvars(request_id=str(request_id)), stage("question_processing"):
+                    await self._process_message(repo, bot, message, request_id=request_id, **kwargs)
+            except Exception:
+                await repo.session.rollback()
+                await repo.ensure_processing_lease()
+                question = await repo.question_by_request(request_id)
+                if question is not None and question.status in {"pending", "processing"}:
+                    await self._recover_interrupted(repo, question, message.from_user.id)
+                await repo.before_external()
+                await self._reply_text(bot, message, AGENT_ERROR)
+                await self.notifications.finish(bot, request_id)
+                raise
+
+    async def _recover_interrupted(self, repo, question, user_id):
+        from sqlalchemy import select
+
+        from app.db.models.entities import CreditTransaction
+
+        result = await repo.session.execute(
+            select(CreditTransaction).where(
+                CreditTransaction.request_id == question.request_id,
+                CreditTransaction.transaction_type == "reservation",
+                CreditTransaction.status == "pending",
+            )
+        )
+        reservation = result.scalar_one_or_none()
+        if reservation:
+            await self.credit_service.release(
+                repo, user_id, question.request_id, reservation.amount
+            )
+        question.status = "failed"
+
+    async def _process_message(
         self,
-        repo: Repository,
-        bot: Bot,
-        message: Message,
+        repo,
+        bot,
+        message,
         *,
         address,
-        update_id: int,
-        bot_username: str,
-        bot_id: int,
-        is_private: bool,
-        response_mode: ResponseMode,
-    ) -> None:
+        update_id,
+        bot_username,
+        bot_id,
+        is_private,
+        response_mode,
+        request_id,
+    ):
         reply_session_id = None
         if not is_private and address.kind == AddressKind.REPLY_TO_BOT and message.reply_to_message:
-            bot_response = await repo.find_bot_response_by_message(
-                message.chat.id,
-                message.reply_to_message.message_id,
+            response = await repo.find_bot_response_by_message(
+                message.chat.id, message.reply_to_message.message_id
             )
-            if bot_response is not None:
-                reply_session_id = bot_response.session_id
-
+            reply_session_id = response.session_id if response else None
         gate_result = await self.gate.evaluate_addressed(
             repo,
             message,
@@ -142,263 +211,266 @@ class QuestionService:
             reply_session_id=reply_session_id,
             enforce_allowed_chat=not is_private,
         )
-
         if gate_result.outcome == GateOutcome.DUPLICATE_UPDATE:
+            interrupted = await repo.question_by_request(request_id)
+            if interrupted is not None and interrupted.status in {"pending", "processing"}:
+                await self._recover_interrupted(repo, interrupted, message.from_user.id)
+                await repo.before_external()
+                await self._reply_text(bot, message, AGENT_ERROR)
+                await self.notifications.finish(bot, request_id)
             return
-        if gate_result.outcome == GateOutcome.REJECT:
+        if gate_result.outcome != GateOutcome.ACCEPT:
+            await repo.before_external()
             if gate_result.user_message:
                 await self._reply_text(bot, message, gate_result.user_message)
             return
-        if gate_result.outcome != GateOutcome.ACCEPT:
-            return
-
-        user_id = message.from_user.id  # type: ignore[union-attr]
-        request_id = uuid.uuid4()
+        user_id = message.from_user.id
         reserved_credits = 0
         credits_committed = False
-        durable_delivery = (
-            self.settings.durable_update_queue_enabled and self.settings.store_bot_responses
-        )
+        handed_to_delivery = False
         try:
-            await bot.send_chat_action(message.chat.id, "typing")
-
-            if await self._maybe_serve_cached_answer(
-                repo,
-                bot,
-                message,
-                update_id=update_id,
-                user_id=user_id,
-                question_text=gate_result.question_text,
-                response_mode=response_mode,
-                allowed=not is_private and reply_session_id is None,
-            ):
-                return
-
+            user = await repo.get_user_by_telegram_id(user_id)
+            level = knowledge_level(user.profile_facts if user else {})
             if is_private:
                 session, relation = await self.session_service.resolve_private_session(
-                    repo, message, context_agent=self.context_relation
+                    repo, message, context_agent=None
                 )
             else:
                 session, relation = await self.session_service.resolve_reply_session(
-                    repo,
-                    message,
-                    bot_id=bot_id,
-                    context_agent=self.context_relation,
+                    repo, message, bot_id=bot_id, context_agent=None
                 )
-
-            contextual = bool(relation and relation.include_previous_context)
-            if await self._maybe_serve_cached_answer(
-                repo,
-                bot,
-                message,
-                update_id=update_id,
-                user_id=user_id,
-                question_text=gate_result.question_text,
-                response_mode=response_mode,
-                allowed=not contextual,
-                session=session,
-                relation=relation.relation if relation else None,
-            ):
-                return
-
-            if is_private:
-                reserved = await self.credit_service.reserve(
-                    repo, user_id, request_id, response_mode
-                )
-                if reserved is None:
-                    await self._reply_text(bot, message, INSUFFICIENT_CREDITS)
-                    return
-                reserved_credits = reserved
-
             question = await repo.create_question(
                 session_id=session.id,
                 raw_question=gate_result.question_text,
                 telegram_update_id=update_id,
                 telegram_message_id=message.message_id,
-                reply_to_message_id=(
-                    message.reply_to_message.message_id if message.reply_to_message else None
-                ),
+                reply_to_message_id=message.reply_to_message.message_id
+                if message.reply_to_message
+                else None,
                 request_id=request_id,
                 response_mode=response_mode,
             )
-
+            # Persist request identity before any AI call, including context classification.
+            await repo.before_external()
+            prev_q, prev_a = await repo.get_previous_qa_for_session(session.id)
+            if prev_q and prev_a:
+                relation = await self.context_relation.evaluate(
+                    repo,
+                    current_question=gate_result.question_text,
+                    previous_question=prev_q.normalized_question or prev_q.raw_question,
+                    previous_answer=prev_a.response_text,
+                    session_id=session.id,
+                    question_id=question.id,
+                )
+                if not is_private and relation.relation == "standalone":
+                    session = await self.session_service.create_new_session(repo, message)
+                    question.session_id = session.id
+            contextual = bool(relation and relation.include_previous_context)
+            history, memory = [], None
+            summary = None
+            previous_question = previous_answer = None
+            if is_private:
+                history, memory = await self._load_private_context(
+                    repo, session.id, user_id, has_summary=bool(session.summary)
+                )
+                summary = session.summary
+            elif contextual:
+                prev_q, prev_a = await repo.get_previous_qa_for_session(session.id)
+                if prev_q and prev_a:
+                    previous_question = prev_q.normalized_question or prev_q.raw_question
+                    previous_answer = self._first_sentences(prev_a.response_text, 1200)
+            cache_allowed = not (contextual or memory or summary or history or previous_answer)
+            if await self._maybe_serve_cached_answer(
+                repo,
+                bot,
+                message,
+                update_id=update_id,
+                user_id=user_id,
+                question_text=gate_result.question_text,
+                response_mode=response_mode,
+                allowed=cache_allowed,
+                session=session,
+                relation=relation.relation if relation else None,
+                level=level,
+                request_id=request_id,
+                question=question,
+            ):
+                handed_to_delivery = self.settings.store_bot_responses
+                return
+            if is_private:
+                reserved = await self.credit_service.reserve(
+                    repo, user_id, request_id, response_mode
+                )
+                if reserved is None:
+                    await repo.before_external()
+                    await self._reply_text(bot, message, INSUFFICIENT_CREDITS)
+                    return
+                reserved_credits = reserved
             filter_question = (
                 relation.rewritten_question
                 if relation and relation.rewritten_question
                 else gate_result.question_text
             )
             filter_result = await self.industry_filter.evaluate(
-                repo,
-                question=filter_question,
-                session_id=session.id,
-                question_id=question.id,
+                repo, question=filter_question, session_id=session.id, question_id=question.id
             )
             if filter_result is None:
                 await self._fail_closed(bot, message, question.id, session.id, repo)
                 return
-
             normalized = filter_result.normalized_question or gate_result.question_text
+            allowed = (
+                filter_result.allowed
+                and not filter_result.is_junk
+                and not filter_result.is_prompt_injection
+                and not filter_result.is_knowledge_exfiltration
+            )
             await repo.update_question_filter_result(
                 question.id,
                 normalized_question=normalized,
                 category=filter_result.category,
-                filter_allowed=filter_result.allowed,
-                status=QuestionStatus.PROCESSING
-                if filter_result.allowed
-                else QuestionStatus.REJECTED,
+                filter_allowed=allowed,
+                status=QuestionStatus.PROCESSING if allowed else QuestionStatus.REJECTED,
             )
-
-            if not filter_result.allowed or filter_result.is_junk:
+            if not allowed:
                 await self.blocking_service.add_junk_score(
                     repo,
                     session.id,
-                    reason="off_topic" if not filter_result.allowed else "junk",
-                    delta=1,
+                    reason="off_topic",
+                    delta=3
+                    if filter_result.is_prompt_injection or filter_result.is_knowledge_exfiltration
+                    else 1,
                 )
+                await repo.before_external()
                 await self._reply_text(bot, message, OFF_TOPIC)
                 return
-
-            if filter_result.is_prompt_injection:
-                await self.blocking_service.add_junk_score(
-                    repo, session.id, reason="prompt_injection", delta=3
-                )
-                await self._reply_text(bot, message, OFF_TOPIC)
-                return
-
-            if filter_result.is_knowledge_exfiltration:
-                await self.blocking_service.add_junk_score(
-                    repo, session.id, reason="exfiltration", delta=3
-                )
-                await self._reply_text(bot, message, OFF_TOPIC)
-                return
-
-            previous_question: str | None = None
-            previous_answer: str | None = None
-            if relation and relation.include_previous_context:
-                prev_q, prev_a = await repo.get_previous_qa_for_session(session.id)
-                if prev_q and prev_a:
-                    previous_question = prev_q.normalized_question or prev_q.raw_question
-                    previous_answer = prev_a.response_text
-            elif relation and relation.relation == ContextRelation.AMBIGUOUS:
-                prev_q, _ = await repo.get_previous_qa_for_session(session.id)
-                if prev_q:
-                    previous_question = prev_q.normalized_question or prev_q.raw_question
-
-            expert_question = (
-                relation.rewritten_question
-                if relation and relation.rewritten_question
-                else normalized
-            )
-
-            conversation_history: list[tuple[str, str]] = []
-            user_memory: str | None = None
-            conversation_summary: str | None = None
-            if is_private:
-                conversation_history, user_memory = await self._load_private_context(
-                    repo,
-                    session.id,
-                    user_id,
-                    has_summary=bool(session.summary),
-                )
-                conversation_summary = session.summary
-                previous_question = None
-                previous_answer = None
-
-            expert_result = await self.main_expert.answer(
+            await self.notifications.start(repo, bot, message, request_id)
+            result = await self.main_expert.answer(
                 repo,
-                question=expert_question,
+                question=filter_question if contextual else normalized,
                 session_id=session.id,
                 question_id=question.id,
                 previous_question=previous_question,
                 previous_answer=previous_answer,
-                conversation_history=conversation_history,
+                conversation_history=history,
                 response_mode=response_mode,
                 request_id=request_id,
-                user_memory=user_memory,
-                conversation_summary=conversation_summary,
+                user_memory=memory,
+                conversation_summary=summary,
+                knowledge_level=level,
             )
-            if expert_result is None or not expert_result.text.strip():
+            if result is None or not result.text.strip():
                 await self._fail_closed(bot, message, question.id, session.id, repo)
                 return
-
-            bot_response = None
-            if self.settings.store_bot_responses:
-                bot_response = await repo.create_bot_response(
-                    session_id=session.id,
-                    question_id=question.id,
-                    response_text=expert_result.text,
-                    timeweb_response_id=expert_result.response_id,
-                    status=("delivery_pending" if durable_delivery else "sent"),
-                )
-                if durable_delivery:
-                    await repo.enqueue_delivery(
-                        bot_response.id,
-                        question.id,
-                        is_private=is_private,
-                        chat_id=message.chat.id,
-                        reply_to_message_id=message.message_id,
-                        message_thread_id=message.message_thread_id,
-                        text_value=expert_result.text,
-                    )
-            if reserved_credits:
-                await self.credit_service.commit(repo, user_id, request_id, reserved_credits)
-                await repo.set_question_credits_charged(question.id, reserved_credits)
-            await repo.update_question_filter_result(
-                question.id,
-                normalized_question=normalized,
-                category=filter_result.category,
-                filter_allowed=True,
-                status=QuestionStatus.ANSWERED,
+            truncated = result.finish_reason in {
+                "length",
+                "max_tokens",
+                "max_output_tokens",
+                "incomplete",
+            }
+            text = result.text
+            if truncated:
+                text += "\n\nОтвет остановлен по лимиту генерации и может быть неполным."
+            else:
+                text = recommend(gate_result.question_text, text, self.settings)
+            snapshot = {
+                "knowledge_level": str(level),
+                "history": history,
+                "summary": summary,
+                "user_memory": memory,
+            }
+            await self._persist_answer(
+                repo,
+                bot,
+                message,
+                session,
+                question,
+                text=text,
+                response_id=result.response_id,
+                snapshot=snapshot,
+                reserved_credits=reserved_credits,
+                user_id=user_id,
+                response_status="truncated" if truncated else "answered",
             )
-            if relation:
-                await repo.update_question_context_relation(question.id, relation.relation)
-
-            if is_private:
-                updated_summary = self._updated_private_summary(
-                    session.summary,
-                    gate_result.question_text,
-                    expert_result.text,
+            credits_committed = True
+            handed_to_delivery = self.settings.store_bot_responses
+            if (
+                cache_allowed
+                and not truncated
+                and self._should_store_cache(
+                    contextual=False, previous_answer=None, question_text=gate_result.question_text
                 )
-                await repo.update_session_summary(session.id, updated_summary)
-
-            if self._should_store_cache(
-                contextual=contextual,
-                previous_answer=previous_answer,
-                question_text=gate_result.question_text,
             ):
                 await self._store_answer_cache(
                     repo,
                     raw_question=gate_result.question_text,
                     normalized_question=normalized,
-                    answer_text=expert_result.text,
+                    answer_text=result.text,
                     source_question_id=question.id,
                     category=filter_result.category,
                     response_mode=response_mode,
+                    level=level,
                 )
-
-            if durable_delivery:
-                await repo.session.commit()
-                credits_committed = bool(reserved_credits)
-            else:
-                sent_message = await self._send_answer_parts(bot, message, expert_result.text)
-                if bot_response is not None:
-                    bot_response.telegram_message_id = sent_message.message_id
-                await repo.update_session_last_bot_message(session.id, sent_message.message_id)
-                if reserved_credits:
-                    credits_committed = True
-
-            logger.info(
-                "question_answered",
-                update_id=update_id,
-                chat_id=message.chat.id,
-                user_id=user_id,
-                session_id=str(session.id),
-                text_len=len(expert_result.text),
-            )
+            if relation:
+                await repo.update_question_context_relation(question.id, relation.relation)
+            await repo.before_external()
         finally:
-            if reserved_credits and not credits_committed:
-                await self.credit_service.release(repo, user_id, request_id, reserved_credits)
-            self.gate.release_concurrent(user_id)
+            try:
+                if reserved_credits and not credits_committed:
+                    await self.credit_service.release(repo, user_id, request_id, reserved_credits)
+                await repo.before_external()
+                if not handed_to_delivery:
+                    await self.notifications.finish(bot, request_id)
+            finally:
+                self.gate.release_concurrent(user_id)
+
+    async def _persist_answer(
+        self,
+        repo,
+        bot,
+        message,
+        session,
+        question,
+        *,
+        text,
+        response_id=None,
+        snapshot=None,
+        reserved_credits=0,
+        user_id,
+        response_status="answered",
+    ):
+        await repo.ensure_processing_lease()
+        if self.settings.store_bot_responses:
+            response = await repo.create_bot_response(
+                session_id=session.id,
+                question_id=question.id,
+                response_text=text,
+                timeweb_response_id=response_id,
+                status="delivery_pending",
+            )
+            response.context_snapshot = snapshot or {}
+            await repo.enqueue_delivery(
+                response.id,
+                question.id,
+                is_private=message.chat.type == "private",
+                chat_id=message.chat.id,
+                reply_to_message_id=message.message_id,
+                message_thread_id=message.message_thread_id,
+                text_value=text,
+            )
+        else:
+            await repo.before_external()
+            sent = await self._send_answer_parts(bot, message, text)
+            await repo.ensure_processing_lease()
+            await repo.update_session_last_bot_message(session.id, sent.message_id)
+        if reserved_credits:
+            await self.credit_service.commit(repo, user_id, question.request_id, reserved_credits)
+            await repo.set_question_credits_charged(question.id, reserved_credits)
+        question.status = response_status
+        if message.chat.type == "private":
+            await repo.update_session_summary(
+                session.id,
+                self._updated_private_summary(session.summary, question.raw_question, text),
+            )
 
     _HISTORY_QUESTION_MAX_CHARS = 180
     _HISTORY_ANSWER_MAX_CHARS = 280
@@ -550,10 +622,13 @@ class QuestionService:
         allowed: bool,
         session=None,
         relation: str | None = None,
+        level="default",
+        request_id=None,
+        question=None,
     ) -> bool:
         if not allowed or not self._cache_lookup_allowed(question_text):
             return False
-        cache_key = self._cache_key(question_text, response_mode)
+        cache_key = self._cache_key(question_text, response_mode, level)
         cached = await repo.get_cached_answer(cache_key)
         if cached is None:
             return False
@@ -569,28 +644,96 @@ class QuestionService:
             session=session,
             relation=relation,
             response_mode=response_mode,
+            level=level,
+            request_id=request_id,
+            question=question,
         )
         return True
 
-    def _cache_key(self, question_text: str, mode: ResponseMode | str) -> str:
+    def _cache_key(self, question_text: str, mode: ResponseMode | str, level="default") -> str:
         normalized = normalize_question_key(question_text)
         return (
             f"{self.settings.knowledge_base_version}:"
-            f"{self.settings.prompt_version}:{str(mode)}:{normalized}"
+            f"{self.settings.prompt_version}:cache2:{str(mode)}:{level}:{normalized}"
         )
 
     async def deliver_job(self, bot: Bot, job):
-        source_message = Message(
-            message_id=job.reply_to_message_id or 0,
-            date=1,
-            chat=Chat(
-                id=job.chat_id,
-                type="private" if job.is_private else "supergroup",
-            ),
-            text="",
-            message_thread_id=job.message_thread_id,
-        )
-        return await self._send_answer_parts(bot, source_message, job.text)
+        return await self.delivery.deliver(bot, job)
+
+    async def on_delivery_failed(self, bot, job):
+        from app.db.session import session_scope
+
+        async with session_scope() as db:
+            question = await Repository(db).get_question(job.question_id)
+        try:
+            await bot.send_message(
+                chat_id=job.chat_id,
+                message_thread_id=job.message_thread_id,
+                text=(
+                    "Ответ сохранён, но не удалось доставить все части. "
+                    "Обратитесь к администратору."
+                ),
+            )
+        finally:
+            if question:
+                await self.notifications.finish(bot, question.request_id)
+
+    async def on_delivery_complete(self, bot, job, parts):
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+        from sqlalchemy import update
+
+        from app.db.models.entities import AnswerExpansion
+        from app.db.session import session_scope
+
+        async with session_scope() as db:
+            repo = Repository(db)
+            question = await repo.get_question(job.question_id)
+            response = await repo.get_bot_response(job.bot_response_id)
+            session = await repo.get_session(question.session_id) if question else None
+            delivered_parts = await repo.delivery_parts(job.id)
+            offer = None
+            if (
+                job.is_private
+                and question
+                and question.response_mode == ResponseMode.QUICK
+                and question.status == "answered"
+                and session
+                and session.closed_at is None
+            ):
+                offer = await repo.offer_expansion(
+                    response.id, self.settings.answer_expansion_credits
+                )
+            await db.execute(
+                update(AnswerExpansion)
+                .where(
+                    AnswerExpansion.question_id == job.question_id,
+                    AnswerExpansion.status == "generated",
+                )
+                .values(status="sent")
+            )
+        if offer and offer.status == "offered" and delivered_parts:
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=job.chat_id,
+                    message_id=delivered_parts[-1].telegram_message_id,
+                    reply_markup=InlineKeyboardMarkup(
+                        inline_keyboard=[
+                            [
+                                InlineKeyboardButton(
+                                    text=(
+                                        f"Раскрыть подробнее · {offer.cost} "
+                                        f"{credit_word(offer.cost)}"
+                                    ),
+                                    callback_data=f"expand:{response.id}",
+                                )
+                            ]
+                        ]
+                    ),
+                )
+            except TelegramAPIError:
+                logger.warning("expansion_button_unavailable", response_id=str(response.id))
+        if question:
+            await self.notifications.finish(bot, question.request_id)
 
     async def _store_answer_cache(
         self,
@@ -602,14 +745,15 @@ class QuestionService:
         source_question_id,
         category: str | None,
         response_mode: ResponseMode | str,
+        level="default",
     ) -> None:
         keys: dict[str, str] = {}
         raw_normalized = normalize_question_key(raw_question)
-        raw_key = self._cache_key(raw_question, response_mode)
+        raw_key = self._cache_key(raw_question, response_mode, level)
         if len(raw_normalized) >= self.settings.answer_cache_min_question_len:
             keys[raw_key] = raw_question
         norm_normalized = normalize_question_key(normalized_question)
-        norm_key = self._cache_key(normalized_question, response_mode)
+        norm_key = self._cache_key(normalized_question, response_mode, level)
         if len(norm_normalized) >= self.settings.answer_cache_min_question_len:
             keys.setdefault(norm_key, normalized_question)
 
@@ -621,70 +765,69 @@ class QuestionService:
                 source_question_id=source_question_id,
                 category=category,
             )
-        logger.info("answer_cache_stored", keys=list(keys.keys()), category=category)
+        logger.info("answer_cache_stored", key_count=len(keys), category=category)
 
     async def _serve_cached_answer(
         self,
-        repo: Repository,
-        bot: Bot,
-        message: Message,
+        repo,
+        bot,
+        message,
         *,
-        update_id: int,
-        user_id: int,
-        question_text: str,
-        cache_key: str,
-        cached: AnswerCache,
+        update_id,
+        user_id,
+        question_text,
+        cache_key,
+        cached,
         session=None,
-        relation: str | None = None,
-        response_mode: ResponseMode | str = ResponseMode.QUICK,
-    ) -> None:
+        relation=None,
+        response_mode=ResponseMode.QUICK,
+        level="default",
+        request_id=None,
+        question=None,
+    ):
         if session is None:
             session = await self.session_service.create_new_session(repo, message)
-
-        question = await repo.create_question(
-            session_id=session.id,
-            raw_question=question_text,
-            telegram_update_id=update_id,
-            telegram_message_id=message.message_id,
-            reply_to_message_id=(
-                message.reply_to_message.message_id if message.reply_to_message else None
-            ),
-            response_mode=response_mode,
-        )
+        if question is None:
+            question = await repo.create_question(
+                session_id=session.id,
+                raw_question=question_text,
+                telegram_update_id=update_id,
+                telegram_message_id=message.message_id,
+                reply_to_message_id=message.reply_to_message.message_id
+                if message.reply_to_message
+                else None,
+                response_mode=response_mode,
+                request_id=request_id,
+            )
         await repo.update_question_filter_result(
             question.id,
-            normalized_question=cache_key,
+            normalized_question=question_text,
             category=cached.category,
             filter_allowed=True,
-            status=QuestionStatus.ANSWERED,
+            status=QuestionStatus.PROCESSING,
         )
         if relation:
             await repo.update_question_context_relation(question.id, relation)
-
-        sent_message = await self._send_answer_parts(bot, message, cached.answer_text)
-        if self.settings.store_bot_responses:
-            await repo.create_bot_response(
-                session_id=session.id,
-                question_id=question.id,
-                response_text=cached.answer_text,
-                telegram_message_id=sent_message.message_id,
-            )
-        await repo.update_session_last_bot_message(session.id, sent_message.message_id)
-        if message.chat.type == "private":
-            updated_summary = self._updated_private_summary(
-                getattr(session, "summary", None),
-                question_text,
-                cached.answer_text,
-            )
-            await repo.update_session_summary(session.id, updated_summary)
+        await self.notifications.start(repo, bot, message, question.request_id)
+        text = recommend(question_text, cached.answer_text, self.settings)
+        await self._persist_answer(
+            repo,
+            bot,
+            message,
+            session,
+            question,
+            text=text,
+            snapshot={"knowledge_level": str(level)},
+            user_id=user_id,
+        )
         await repo.record_cache_hit(cache_key)
+        await repo.before_external()
+        if not self.settings.store_bot_responses:
+            await self.notifications.finish(bot, question.request_id)
         logger.info(
             "answer_cache_hit",
             update_id=update_id,
-            chat_id=message.chat.id,
             user_id=user_id,
-            session_id=str(session.id),
-            cache_key=cache_key,
             text_len=len(cached.answer_text),
         )
 
@@ -704,47 +847,32 @@ class QuestionService:
             status=QuestionStatus.FAILED,
         )
         await self.blocking_service.add_junk_score(repo, session_id, reason="agent_error", delta=0)
+        await repo.before_external()
         await self._reply_text(bot, message, AGENT_ERROR)
 
     async def _send_answer_parts(self, bot: Bot, message: Message, text: str):
-        if self.settings.rich_messages_enabled:
-            try:
-                return await self._send_rich_answer_parts(bot, message, text)
-            except TelegramAPIError as exc:
-                logger.warning(
-                    "telegram_rich_fallback",
-                    chat_id=message.chat.id,
-                    error=str(exc),
-                )
-        return await self._send_html_answer_parts(bot, message, text)
-
-    async def _send_rich_answer_parts(self, bot: Bot, message: Message, text: str):
-        markdown = prep_rich_markdown(text)
-        parts = split_rich_message(markdown)
-        sent_message = await self._send_rich_message(bot, message, parts[0], reply=True)
-        for part in parts[1:]:
-            await self._send_rich_message(bot, message, part, reply=False)
-        return sent_message
-
-    async def _send_html_answer_parts(self, bot: Bot, message: Message, text: str):
-        html_text = format_response_html(text)
-        parts = split_html_message(html_text)
-        sent_message = await self._send_message(
-            bot,
-            message,
-            parts[0],
-            parse_mode=ParseMode.HTML,
-            reply=True,
-        )
-        for part in parts[1:]:
-            await self._send_message(
-                bot,
-                message,
-                part,
-                parse_mode=ParseMode.HTML,
-                reply=False,
-            )
-        return sent_message
+        first = None
+        for index, (part, format_value) in enumerate(
+            delivery_plan(text, rich_enabled=self.settings.rich_messages_enabled)
+        ):
+            with stage("telegram_send", part_index=index):
+                if format_value == "rich":
+                    try:
+                        sent = await self._send_rich_message(bot, message, part, reply=index == 0)
+                    except TelegramBadRequest:
+                        sent = await self._send_message(
+                            bot,
+                            message,
+                            format_response_html(part),
+                            parse_mode=ParseMode.HTML,
+                            reply=index == 0,
+                        )
+                else:
+                    sent = await self._send_message(
+                        bot, message, part, parse_mode=ParseMode.HTML, reply=index == 0
+                    )
+            first = first or sent
+        return first
 
     @staticmethod
     async def _send_rich_message(
@@ -796,8 +924,7 @@ class QuestionService:
             "text": text,
             "message_thread_id": message.message_thread_id,
         }
-        if parse_mode is not None:
-            kwargs["parse_mode"] = parse_mode
+        kwargs["parse_mode"] = parse_mode
         if message.chat.type == "private" and reply:
             kwargs["reply_markup"] = private_menu_keyboard()
         if reply:

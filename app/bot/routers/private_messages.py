@@ -25,7 +25,6 @@ from app.domain.messages import (
     ACCESS_BLOCKED,
     ACCESS_PENDING,
     ACCESS_REJECTED,
-    BALANCE,
     BALANCE_UNLIMITED,
     HELP,
     MEMORY_FORGOTTEN,
@@ -34,7 +33,10 @@ from app.domain.messages import (
     NEW_DIALOG_STARTED,
     PRIVACY,
     WELCOME,
+    balance_text,
 )
+from app.services.knowledge_level import LEVEL_LABELS, KnowledgeLevel, knowledge_level
+from app.services.message_content import clean_question, has_meaningful_text, supports_question
 
 router = Router(name="private_messages")
 
@@ -116,6 +118,48 @@ async def private_deep(message: Message, settings, bot, access_service) -> None:
     await _answer(message, MODE_DEEP.format(credits=settings.deep_mode_credits))
 
 
+@router.message(F.chat.type == "private", Command("level"))
+async def private_level(message: Message, settings, bot, access_service) -> None:
+    user = await _active_user(message, settings, bot, access_service)
+    if user is None:
+        return
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=label, callback_data=f"level:{level}")]
+            for level, label in LEVEL_LABELS.items()
+        ]
+    )
+    await message.answer(
+        "Уровень объяснений: " + LEVEL_LABELS[knowledge_level(user.profile_facts)],
+        reply_markup=keyboard,
+    )
+
+
+@router.callback_query(F.data.startswith("level:"))
+async def choose_level(callback: CallbackQuery) -> None:
+    try:
+        level = KnowledgeLevel((callback.data or "").split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректный уровень", show_alert=True)
+        return
+    async with session_scope() as db:
+        repo = Repository(db)
+        user = await repo.get_user_by_telegram_id(callback.from_user.id)
+        if (
+            user is None
+            or user.access_status != AccessStatus.ACTIVE
+            or callback.message is None
+            or callback.message.chat.type != "private"
+            or callback.message.chat.id != callback.from_user.id
+        ):
+            await callback.answer("Доступ не разрешён", show_alert=True)
+            return
+        await repo.set_knowledge_level(callback.from_user.id, level)
+    await callback.answer("Уровень сохранён")
+    if callback.message:
+        await callback.message.edit_text("Уровень объяснений: " + LEVEL_LABELS[level])
+
+
 @router.message(F.chat.type == "private", Command("mode"))
 async def private_mode(message: Message, settings, bot, access_service) -> None:
     user = await _active_user(message, settings, bot, access_service)
@@ -143,7 +187,7 @@ async def private_balance(message: Message, settings, bot, access_service) -> No
         account = await Repository(db).get_or_create_credit_account(
             message.from_user.id  # type: ignore[union-attr]
         )
-        text = BALANCE.format(balance=account.balance, reserved=account.reserved)
+        text = balance_text(account.balance, account.reserved)
     await _answer(message, text)
 
 
@@ -175,10 +219,16 @@ async def private_profile(message: Message, settings, bot, access_service) -> No
     if user is None:
         return
     facts = user.profile_facts.get("confirmed", [])
+    level_text = "Уровень: " + LEVEL_LABELS[knowledge_level(user.profile_facts)] + "\n"
     if not facts:
-        await _answer(message, "Подтверждённых фактов пока нет. Добавьте их через /remember.")
+        await _answer(
+            message, level_text + "Подтверждённых фактов пока нет. Добавьте их через /remember."
+        )
         return
-    await _answer(message, "Подтверждённые сведения:\n" + "\n".join(f"• {fact}" for fact in facts))
+    await _answer(
+        message,
+        level_text + "Подтверждённые сведения:\n" + "\n".join(f"• {fact}" for fact in facts),
+    )
 
 
 @router.message(F.chat.type == "private", Command("forget"))
@@ -219,6 +269,26 @@ async def cancel_forget(callback: CallbackQuery) -> None:
     await callback.answer()
     if callback.message:
         await callback.message.edit_text("Удаление отменено.")
+
+
+@router.callback_query(F.data.startswith("expand:"))
+async def expand_answer(callback: CallbackQuery, bot, question_service) -> None:
+    from app.services.answer_expansion_service import AnswerExpansionService
+
+    try:
+        response_id = uuid.UUID((callback.data or "").split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректная кнопка", show_alert=True)
+        return
+    if callback.message is None or callback.message.chat.type != "private":
+        await callback.answer("Ответ не найден", show_alert=True)
+        return
+    await callback.answer()
+    status = await AnswerExpansionService(question_service).expand(
+        bot, response_id, callback.from_user.id, callback.message.chat.id
+    )
+    if not status.startswith("Готовлю доставку"):
+        await callback.message.answer(status)
 
 
 @router.callback_query(F.data.startswith("feedback:"))
@@ -285,6 +355,10 @@ async def private_question(
     bot_id: int,
     update_id: int,
 ) -> None:
+    if not supports_question(message) or not has_meaningful_text(
+        clean_question(message.text or "")
+    ):
+        return
     user = await _active_user(message, settings, bot, access_service)
     if user is None:
         return

@@ -24,8 +24,12 @@ class CreditService:
         telegram_user_id: int,
         request_id: uuid.UUID,
         mode: ResponseMode | str,
+        *,
+        amount: int | None = None,
     ) -> int | None:
-        amount = self.cost_for_mode(mode)
+        amount = self.cost_for_mode(mode) if amount is None else amount
+        if amount < 0:
+            raise ValueError("Credit amount must be non-negative")
         if telegram_user_id in self.settings.admin_user_ids:
             return 0
         user = await repo.get_user_by_telegram_id(telegram_user_id)

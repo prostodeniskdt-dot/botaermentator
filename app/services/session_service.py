@@ -40,6 +40,9 @@ class SessionService:
         if session is None:
             return await self.create_new_session(repo, message), None
 
+        if context_agent is None:
+            return session, None
+
         prev_q, prev_a = await repo.get_previous_qa_for_session(session.id)
         if prev_q is None or prev_a is None:
             return session, None
@@ -83,6 +86,9 @@ class SessionService:
         ):
             session = await self.create_new_session(repo, message)
             return session, None
+
+        if context_agent is None:
+            return prev_session, None
 
         prev_q, prev_a = await repo.get_previous_qa_for_session(prev_session.id)
         if prev_q is None or prev_a is None:

@@ -85,7 +85,9 @@ python scripts/set_webhook.py
 - Administrator receives the request and runs `/admin_allow <telegram_user_id>`
 - Approved user receives the starting balance, the bottom menu, and can ask a private question
 - Answers are not followed by a rating prompt
-- `/quick`, `/deep`, `/new`, `/remember`, `/profile`, `/forget`, and `/balance` work
+- `/quick`, `/deep`, `/level`, `/new`, `/remember`, `/profile`, `/forget`, and `/balance` work
+- A Quick answer offers one configurable-price expansion; repeated clicks never charge twice
+- A temporary acceptance notice disappears after the last answer part
 - Restart during processing → queued update or answer delivery resumes
 
 ## 8. BotFather
@@ -99,6 +101,7 @@ new - Начать новую тему
 quick - Краткий режим
 deep - Подробный режим
 mode - Текущий режим
+level - Уровень объяснений
 balance - Баланс кредитов
 remember - Сохранить подтвержденный факт
 profile - Показать подтвержденные факты
@@ -122,3 +125,20 @@ configure Group Privacy consistently with the group scenario and test it before 
 - `/admin_kill_switch_on` / `/admin_kill_switch_off`
 
 Credits are internal accounting units. There is no payment or Telegram Stars integration.
+
+
+## Upgrade from version 005
+
+Read CHANGE_DIAGNOSTICS.md before upgrading. Stop the old queue consumers before applying migrations
+006/007; never run old/new workers concurrently on the same queue. The startup script still applies
+migrations, so deployment must be coordinated to avoid overlapping old workers with the new schema.
+No production deployment is performed automatically by this change.
+
+New non-secret settings are documented in `.env.example`. Start with UPDATE_QUEUE_CONCURRENCY=2 per
+process; reserve database connections for service commands, delivery and heartbeat. Account for the
+number of application processes when checking provider and database capacity. Delivery and notice
+maintenance also run when durable update enqueueing is disabled.
+
+Verify all Timeweb transports, actual KB attachment and response finish reasons on a test agent.
+Output defaults stay 600/2200 until larger limits are verified with the configured model. Do not
+claim a speedup from mock-test timings. Never blindly requeue a delivery with an unknown send outcome.

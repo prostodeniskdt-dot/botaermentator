@@ -19,9 +19,30 @@ WELCOME = (
 )
 NEW_DIALOG_STARTED = "Начата новая тема. Сохранённые сведения профиля не удалены."
 MEMORY_FORGOTTEN = "Рабочая память и личные диалоги очищены."
-MODE_QUICK = "Включён краткий режим. Стоимость ответа: {credits} кредит."
-MODE_DEEP = "Включён подробный режим. Стоимость ответа: {credits} кредитов."
-BALANCE = "Баланс: {balance} кредитов. Зарезервировано: {reserved}."
+MODE_QUICK = (
+    "Кратко: действия, ключевые параметры и необходимые предупреждения. "
+    "Стоимость: {credits} кредит."
+)
+MODE_DEEP = (
+    "Подробно: механизмы, параметры, варианты и способы проверки. Стоимость: {credits} кредитов."
+)
+
+
+def credit_word(amount: int) -> str:
+    if 11 <= abs(amount) % 100 <= 14:
+        return "кредитов"
+    return {1: "кредит", 2: "кредита", 3: "кредита", 4: "кредита"}.get(abs(amount) % 10, "кредитов")
+
+
+def balance_text(balance: int, reserved: int) -> str:
+    available = balance - reserved
+    text = f"Доступно: {available} {credit_word(available)}"
+    if reserved > 0:
+        text += f". В обработке: {reserved} {credit_word(reserved)}."
+    return text
+
+
+BALANCE = "Доступно: {balance} кредитов"
 BALANCE_UNLIMITED = "Баланс: безлимитный."
 INSUFFICIENT_CREDITS = "Недостаточно кредитов. Обратитесь к администратору."
 HELP = (
@@ -35,6 +56,8 @@ HELP = (
     "/remember текст — запомнить факт\n"
     "/forget — удалить рабочую память\n"
     "/mode — показать текущий режим\n"
+    "/level — выбрать уровень объяснений\n"
+    "Под кратким ответом можно раскрыть подробности за указанную на кнопке стоимость.\n"
     "/privacy — какие данные хранятся"
 )
 PRIVACY = (

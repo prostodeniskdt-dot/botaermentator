@@ -10,6 +10,7 @@ from functools import partial
 from aiogram import BaseMiddleware
 from aiogram.types import BotCommand, TelegramObject, Update
 from fastapi import FastAPI
+from structlog.contextvars import bound_contextvars
 
 from app import __version__
 from app.agents.context_relation import ContextRelationAgent
@@ -22,6 +23,7 @@ from app.bot.factory import build_services, create_bot, create_dispatcher
 from app.config import clear_settings_cache, get_settings
 from app.db.session import check_database_connection, get_engine, reset_engine
 from app.logging import configure_logging, get_logger
+from app.services.metrics import stage
 from app.services.update_queue import UpdateQueueWorker
 
 
@@ -37,7 +39,8 @@ class UpdateContextMiddleware(BaseMiddleware):
             data["update_id"] = event.update_id
         data.setdefault("bot_username", self.bot_username)
         data.setdefault("bot_id", self.bot_id)
-        return await handler(event, data)
+        with bound_contextvars(update_id=data.get("update_id")), stage("telegram_update"):
+            return await handler(event, data)
 
 
 @asynccontextmanager
@@ -134,8 +137,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
             logger.error("database_connection_failed")
 
     if (
-        settings.durable_update_queue_enabled
-        and settings.database_url
+        settings.database_url
         and bot is not None
         and dispatcher is not None
         and question_service is not None
@@ -148,6 +150,10 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
             stale_after_seconds=settings.update_queue_stale_seconds,
             heartbeat_seconds=settings.update_queue_heartbeat_seconds,
             delivery_handler=partial(question_service.deliver_job, bot),
+            concurrency=settings.update_queue_concurrency,
+            enable_updates=settings.durable_update_queue_enabled,
+            maintenance_handler=partial(question_service.notifications.cleanup, bot),
+            delivery_failure_handler=partial(question_service.on_delivery_failed, bot),
         )
         update_worker_task = asyncio.create_task(update_worker.run(), name="telegram-update-queue")
 
@@ -160,6 +166,8 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         await timeweb_client.aclose()
         if bot is not None:
             await bot.session.close()
+        if settings.database_url:
+            await get_engine(settings).dispose()
         reset_engine()
         logger.info("app_stopping")
 
@@ -169,6 +177,7 @@ def _private_commands() -> list[BotCommand]:
         BotCommand(command="new", description="Начать новую тему"),
         BotCommand(command="quick", description="Краткий режим"),
         BotCommand(command="deep", description="Подробный режим"),
+        BotCommand(command="level", description="Уровень объяснений"),
         BotCommand(command="balance", description="Баланс кредитов"),
         BotCommand(command="profile", description="Сохранённые факты"),
         BotCommand(command="remember", description="Запомнить факт"),

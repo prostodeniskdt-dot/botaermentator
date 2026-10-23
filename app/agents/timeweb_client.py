@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, replace
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from app.config import Settings
 from app.logging import get_logger
+from app.services.metrics import stage
 
 logger = get_logger(__name__)
 
@@ -77,70 +78,57 @@ class TimewebClient:
         message: str,
         max_output_tokens: int | None = None,
     ) -> TimewebCallResult:
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        attempts = max(1, self.settings.timeweb_max_attempts)
-        last_error: Exception | None = None
+        started = time.perf_counter()
+        with stage("agent_call", agent_id=agent_id, input_chars=len(message)):
+            try:
+                async with asyncio.timeout(self.settings.timeweb_deadline_seconds):
+                    result = await self._call_bounded(agent_id, token, message, max_output_tokens)
+            except TimeoutError as exc:
+                raise TimewebTimeoutError("Agent deadline exceeded", error_code="deadline") from exc
+        return replace(result, latency_ms=int((time.perf_counter() - started) * 1000))
 
-        retryable_failure = False
-        for attempt in range(1, attempts + 1):
-            retryable_failure = False
-            for mode, url, payload in self._request_variants(agent_id, message, max_output_tokens):
-                started = time.perf_counter()
+    async def _call_bounded(self, agent_id, token, message, max_output_tokens):
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        last_error = None
+        count = 0
+        for mode, url, payload in self._request_variants(agent_id, message, max_output_tokens):
+            for attempt in range(1, self.settings.timeweb_max_attempts + 1):
+                if count >= self.settings.timeweb_max_http_requests:
+                    raise last_error or TimewebClientError("HTTP request budget exhausted")
+                count += 1
                 try:
-                    result = await self._post_once(url, headers, payload, started)
-                    if mode != "native":
-                        logger.info(
-                            "timeweb_fallback_ok",
-                            agent_id=agent_id,
-                            mode=mode,
-                        )
-                    return replace(result, transport=mode, attempt_number=attempt)
-                except TimewebTimeoutError as exc:
-                    last_error = exc
-                    retryable_failure = True
-                    logger.warning(
-                        "timeweb_timeout",
-                        agent_id=agent_id,
-                        attempt=attempt,
-                        mode=mode,
-                        url=url,
-                    )
+                    with stage("agent_http", agent_id=agent_id, transport=mode, attempt=count):
+                        result = await self._post_once(url, headers, payload, time.perf_counter())
+                    return replace(result, transport=mode, attempt_number=count)
+                except TimewebTimeoutError:
+                    # The provider may already have billed/completed this request.
+                    raise
                 except TimewebHTTPError as exc:
                     last_error = exc
                     logger.warning(
                         "timeweb_http_error",
                         agent_id=agent_id,
-                        attempt=attempt,
-                        mode=mode,
+                        transport=mode,
+                        attempt=count,
                         status=exc.status_code,
-                        url=url,
+                        error_code=exc.error_code,
                     )
-                    # Hard-stop on auth / quota — other transports will fail the same way.
-                    if exc.status_code in {401, 402, 403}:
+                    if (
+                        exc.status_code in {401, 402, 403}
+                        or exc.error_code == "token_limit_exceeded"
+                    ):
                         raise
-                    if exc.error_code == "token_limit_exceeded":
-                        raise
-                    # Try next transport for provider_error / 400; retry later on 5xx.
-                    if exc.status_code and exc.status_code >= 500:
-                        retryable_failure = True
-                except httpx.HTTPError as exc:
-                    last_error = TimewebClientError(str(exc), error_code="transport_error")
-                    retryable_failure = True
-                    logger.warning(
-                        "timeweb_transport_error",
-                        agent_id=agent_id,
-                        attempt=attempt,
-                        mode=mode,
-                        url=url,
-                    )
-
-            if attempt < attempts and retryable_failure:
-                await self._backoff(attempt)
-                continue
-            break
-
-        assert last_error is not None
-        raise last_error
+                    if exc.status_code in {400, 404, 405, 422}:
+                        break  # Known unsupported variant: advance to next transport.
+                    if exc.status_code == 429 or (exc.status_code and exc.status_code >= 500):
+                        if attempt == self.settings.timeweb_max_attempts:
+                            raise
+                        await asyncio.sleep(
+                            getattr(exc, "retry_after", None) or min(2**attempt * 0.25, 2)
+                        )
+                        continue
+                    raise
+        raise last_error or TimewebClientError("No compatible transport")
 
     def _request_variants(
         self, agent_id: str, message: str, max_output_tokens: int | None = None
@@ -214,12 +202,6 @@ class TimewebClient:
     def _openai_compat_url(agent_id: str, suffix: str) -> str:
         return f"{_OPENAI_COMPAT_HOST}/api/v1/cloud-ai/agents/{agent_id}/v1/{suffix}"
 
-    @retry(
-        reraise=True,
-        stop=stop_after_attempt(1),
-        wait=wait_exponential(multiplier=0.5, min=0.5, max=2),
-        retry=retry_if_exception_type(TimewebTimeoutError),
-    )
     async def _post_once(
         self,
         url: str,
@@ -230,31 +212,39 @@ class TimewebClient:
         try:
             response = await self._client.post(url, headers=headers, json=payload)
         except httpx.TimeoutException as exc:
-            raise TimewebTimeoutError(str(exc), error_code="timeout") from exc
+            raise TimewebTimeoutError(
+                "Provider timeout; result unknown", error_code="timeout"
+            ) from exc
         except httpx.HTTPError as exc:
-            raise TimewebClientError(str(exc), error_code="transport_error") from exc
+            raise TimewebClientError(
+                "Provider transport failure; result unknown", error_code="transport_error"
+            ) from exc
 
         latency_ms = int((time.perf_counter() - started) * 1000)
 
         if response.status_code >= 400:
-            body_preview = (response.text or "")[:500]
-            logger.error(
-                "timeweb_http_error_body",
-                status=response.status_code,
-                body=body_preview,
-                url=url,
-            )
             error_code = "http_error"
-            lowered = body_preview.lower()
-            if "token_limit_exceeded" in lowered:
+            if "token_limit_exceeded" in response.text.lower():
                 error_code = "token_limit_exceeded"
-            raise TimewebHTTPError(
-                f"HTTP {response.status_code}: {body_preview}",
+            error = TimewebHTTPError(
+                f"Provider HTTP {response.status_code}",
                 status_code=response.status_code,
                 error_code=error_code,
             )
+            try:
+                error.retry_after = min(max(float(response.headers.get("Retry-After", "0")), 0), 60)
+            except ValueError:
+                error.retry_after = 0
+            raise error
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise TimewebClientError(
+                "Invalid provider JSON", error_code="invalid_response"
+            ) from exc
+        if not isinstance(data, dict):
+            raise TimewebClientError("Invalid provider response", error_code="invalid_response")
 
-        data = response.json()
         message_text = _extract_message(data)
         if not message_text.strip():
             raise TimewebHTTPError(
@@ -266,7 +256,7 @@ class TimewebClient:
         return TimewebCallResult(
             message=message_text,
             response_id=str(data.get("id") or data.get("response_id") or "") or None,
-            finish_reason=data.get("finish_reason") or data.get("status"),
+            finish_reason=_finish_reason(data),
             http_status=response.status_code,
             latency_ms=latency_ms,
             raw=data,
@@ -324,3 +314,13 @@ def _extract_message(data: dict[str, Any]) -> str:
             return "\n".join(parts)
 
     return ""
+
+
+def _finish_reason(data: dict) -> str | None:
+    choices = data.get("choices") or []
+    reason = data.get("finish_reason")
+    if not reason and choices and isinstance(choices[0], dict):
+        reason = choices[0].get("finish_reason")
+    if data.get("status") == "incomplete":
+        reason = (data.get("incomplete_details") or {}).get("reason") or "incomplete"
+    return reason or data.get("status")

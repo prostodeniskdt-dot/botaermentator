@@ -100,6 +100,8 @@ class UserQuestion(Base):
 class BotResponse(Base):
     __tablename__ = "bot_responses"
 
+    context_snapshot: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}")
+
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     session_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("chat_sessions.id"), index=True)
     question_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("user_questions.id"), index=True)
@@ -270,6 +272,7 @@ class TelegramUpdateJob(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     telegram_update_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
     payload: Mapped[dict] = mapped_column(JSONB)
+    lane: Mapped[str] = mapped_column(String(16), default="question", server_default="question")
     status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     available_at: Mapped[datetime] = mapped_column(
@@ -322,3 +325,49 @@ class TelegramDeliveryJob(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class UserProcessingLease(Base):
+    __tablename__ = "user_processing_leases"
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    owner: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    request_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class TaskNotice(Base):
+    __tablename__ = "task_notices"
+    request_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger)
+    message_id: Mapped[int] = mapped_column(BigInteger)
+    state: Mapped[str] = mapped_column(String(24), default="active")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TelegramDeliveryPart(Base):
+    __tablename__ = "telegram_delivery_parts"
+    __table_args__ = (UniqueConstraint("delivery_job_id", "part_index", name="uq_delivery_part"),)
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    delivery_job_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("telegram_delivery_jobs.id"), index=True
+    )
+    part_index: Mapped[int] = mapped_column(Integer)
+    text: Mapped[str] = mapped_column(Text)
+    format: Mapped[str] = mapped_column(String(16))
+    state: Mapped[str] = mapped_column(String(24), default="pending")
+    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+
+class AnswerExpansion(Base):
+    __tablename__ = "answer_expansions"
+    source_response_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("bot_responses.id"), primary_key=True
+    )
+    request_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), unique=True)
+    question_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("user_questions.id"), nullable=True
+    )
+    status: Mapped[str] = mapped_column(String(24), default="offered")
+    cost: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
