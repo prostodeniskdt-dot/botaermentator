@@ -181,12 +181,22 @@ class UpdateQueueWorker:
         if job.lease_id is None:
             logger.error("delivery_missing_lease", job_id=str(job.id))
             return
+        logger.info(
+            "delivery_queue_wait",
+            delivery_id=str(job.id),
+            question_id=str(job.question_id),
+            attempt=job.attempts,
+            wait_ms=max(0, (datetime.now(UTC) - job.created_at).total_seconds() * 1000),
+        )
         heartbeat = asyncio.create_task(
             self._delivery_heartbeat_loop(job.id, job.lease_id, asyncio.current_task()),
             name=f"delivery-heartbeat-{job.id}",
         )
         try:
-            sent_message = await self.delivery_handler(job)
+            with stage(
+                "answer_delivery", delivery_id=str(job.id), question_id=str(job.question_id)
+            ):
+                sent_message = await self.delivery_handler(job)
         except Exception as exc:  # noqa: BLE001
             logger.exception("telegram_delivery_failed", job_id=str(job.id))
             retry = job.attempts < self.max_attempts and not getattr(exc, "delivery_unknown", False)

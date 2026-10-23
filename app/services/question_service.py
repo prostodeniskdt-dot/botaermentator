@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 
 from aiogram import Bot
@@ -49,6 +50,8 @@ logger = get_logger(__name__)
 
 class QuestionService:
     """Runs gate, agents, persistence, and Telegram replies."""
+
+    _BUTTON_TIMEOUT_SECONDS = 5
 
     def __init__(
         self,
@@ -711,29 +714,31 @@ class QuestionService:
                 )
                 .values(status="sent")
             )
-        if offer and offer.status == "offered" and delivered_parts:
-            try:
-                await bot.edit_message_reply_markup(
-                    chat_id=job.chat_id,
-                    message_id=delivered_parts[-1].telegram_message_id,
-                    reply_markup=InlineKeyboardMarkup(
-                        inline_keyboard=[
-                            [
-                                InlineKeyboardButton(
-                                    text=(
-                                        f"Раскрыть подробнее · {offer.cost} "
-                                        f"{credit_word(offer.cost)}"
-                                    ),
-                                    callback_data=f"expand:{response.id}",
-                                )
-                            ]
-                        ]
-                    ),
-                )
-            except TelegramAPIError:
-                logger.warning("expansion_button_unavailable", response_id=str(response.id))
         if question:
             await self.notifications.finish(bot, question.request_id)
+        if offer and offer.status == "offered" and delivered_parts:
+            try:
+                with stage("expansion_button", delivery_id=str(job.id)):
+                    async with asyncio.timeout(self._BUTTON_TIMEOUT_SECONDS):
+                        await bot.edit_message_reply_markup(
+                            chat_id=job.chat_id,
+                            message_id=delivered_parts[-1].telegram_message_id,
+                            reply_markup=InlineKeyboardMarkup(
+                                inline_keyboard=[
+                                    [
+                                        InlineKeyboardButton(
+                                            text=(
+                                                f"Раскрыть подробнее · {offer.cost} "
+                                                f"{credit_word(offer.cost)}"
+                                            ),
+                                            callback_data=f"expand:{response.id}",
+                                        )
+                                    ]
+                                ]
+                            ),
+                        )
+            except (TelegramAPIError, TimeoutError):
+                logger.warning("expansion_button_unavailable", response_id=str(response.id))
 
     async def _store_answer_cache(
         self,

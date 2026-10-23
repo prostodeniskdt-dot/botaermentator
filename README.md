@@ -20,6 +20,7 @@ Production-oriented bot with:
 - AI usage, feedback, limits, blocking, and versioned FAQ cache.
 
 User instructions: `docs/USER_GUIDE.md`. Diagnostics, migration notes and validation: `docs/CHANGE_DIAGNOSTICS.md`.
+Post-release response latency investigation: `docs/LATENCY_DIAGNOSTICS.md`.
 
 See `docs/IMPLEMENTATION_PLAN.md`, `docs/ARCHITECTURE.md`, and
 `docs/TIMEWEB_SETUP.md`.

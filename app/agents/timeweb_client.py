@@ -57,8 +57,12 @@ class TimewebCallResult:
 class TimewebClient:
     """Calls Timeweb Cloud AI agents via native API with OpenAI-compatible fallbacks."""
 
+    _TRANSPORT_PREFERENCE_SECONDS = 600
+
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        # Store only endpoint metadata, never tokens, questions or responses.
+        self._transport_preferences: dict[tuple[str, bool], tuple[str, str, float]] = {}
         timeout = httpx.Timeout(
             connect=settings.timeweb_connect_timeout_seconds,
             read=settings.timeweb_read_timeout_seconds,
@@ -91,7 +95,14 @@ class TimewebClient:
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         last_error = None
         count = 0
-        for mode, url, payload in self._request_variants(agent_id, message, max_output_tokens):
+        key = (agent_id, max_output_tokens is not None)
+        variants = self._request_variants(agent_id, message, max_output_tokens)
+        preferred = self._transport_preferences.get(key)
+        if preferred and time.monotonic() < preferred[2]:
+            variants.sort(key=lambda variant: (variant[0], variant[1]) != preferred[:2])
+        else:
+            self._transport_preferences.pop(key, None)
+        for mode, url, payload in variants:
             for attempt in range(1, self.settings.timeweb_max_attempts + 1):
                 if count >= self.settings.timeweb_max_http_requests:
                     raise last_error or TimewebClientError("HTTP request budget exhausted")
@@ -99,6 +110,11 @@ class TimewebClient:
                 try:
                     with stage("agent_http", agent_id=agent_id, transport=mode, attempt=count):
                         result = await self._post_once(url, headers, payload, time.perf_counter())
+                    self._transport_preferences[key] = (
+                        mode,
+                        url,
+                        time.monotonic() + self._TRANSPORT_PREFERENCE_SECONDS,
+                    )
                     return replace(result, transport=mode, attempt_number=count)
                 except TimewebTimeoutError:
                     # The provider may already have billed/completed this request.
@@ -119,6 +135,8 @@ class TimewebClient:
                     ):
                         raise
                     if exc.status_code in {400, 404, 405, 422}:
+                        if preferred and (mode, url) == preferred[:2]:
+                            self._transport_preferences.pop(key, None)
                         break  # Known unsupported variant: advance to next transport.
                     if exc.status_code == 429 or (exc.status_code and exc.status_code >= 500):
                         if attempt == self.settings.timeweb_max_attempts:

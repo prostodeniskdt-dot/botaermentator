@@ -1,5 +1,6 @@
 """Best-effort lifecycle for durable temporary Telegram notices."""
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
@@ -7,18 +8,24 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from app.db.repositories import Repository
 from app.db.session import session_scope
 from app.logging import get_logger
+from app.services.metrics import stage
 
 logger = get_logger(__name__)
 ACCEPTED = "Задачу получил, начинаю подготовку ответа."
 
 
 class TaskNotificationService:
+    _TELEGRAM_TIMEOUT_SECONDS = 5
+
     async def start(self, repo, bot, message, request_id):
         await repo.before_external()
         try:
-            sent = await bot.send_message(
-                chat_id=message.chat.id, text=ACCEPTED, message_thread_id=message.message_thread_id
-            )
+            with stage("task_notice_send", request_id=str(request_id)):
+                sent = await bot.send_message(
+                    chat_id=message.chat.id,
+                    text=ACCEPTED,
+                    message_thread_id=message.message_thread_id,
+                )
         except TelegramAPIError:
             logger.warning("task_notice_send_failed", request_id=str(request_id))
             return
@@ -44,7 +51,11 @@ class TaskNotificationService:
             if datetime.now(UTC) - notice.created_at >= timedelta(hours=47):
                 state = "unavailable"
             else:
-                await bot.delete_message(chat_id=notice.chat_id, message_id=notice.message_id)
+                with stage("task_notice_delete", request_id=str(request_id)):
+                    async with asyncio.timeout(self._TELEGRAM_TIMEOUT_SECONDS):
+                        await bot.delete_message(
+                            chat_id=notice.chat_id, message_id=notice.message_id
+                        )
         except TelegramBadRequest as exc:
             state = (
                 "deleted" if "message to delete not found" in str(exc).lower() else "unavailable"

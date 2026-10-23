@@ -14,6 +14,7 @@ from app.db.repositories import Repository
 from app.domain.enums import AgentType, ResponseMode
 from app.logging import get_logger
 from app.services.knowledge_level import LEVEL_INSTRUCTIONS, KnowledgeLevel
+from app.services.metrics import stage
 
 logger = get_logger(__name__)
 
@@ -126,12 +127,15 @@ class MainExpertAgent:
         started = datetime.now(UTC)
         try:
             await repo.before_external()
-            call = await self.client.call_agent(
-                agent_id=self.settings.timeweb_agent_3_id,
-                token=self.settings.timeweb_agent_3_token,
-                message=message,
-                max_output_tokens=max_output_tokens,
-            )
+            with stage(
+                "expert_generation", question_id=str(question_id), response_mode=str(response_mode)
+            ):
+                call = await self.client.call_agent(
+                    agent_id=self.settings.timeweb_agent_3_id,
+                    token=self.settings.timeweb_agent_3_token,
+                    message=message,
+                    max_output_tokens=max_output_tokens,
+                )
             estimated = self.settings.agent_3_estimated_cost_rub
             if call.used_web_search:
                 estimated += self.settings.web_search_estimated_cost_rub
