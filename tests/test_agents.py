@@ -86,7 +86,8 @@ async def test_agent1_off_topic(settings: Settings, timeweb_base: str, mock_repo
 def test_parse_json_with_fences():
     payload = (
         '{"allowed": true, "category": "x", "confidence": 0.5, '
-        '"reason_code": "r", "normalized_question": "q"}'
+        '"reason_code": "r", "normalized_question": "q", "is_prompt_injection": false, '
+        '"is_knowledge_exfiltration": false, "is_junk": false}'
     )
     raw = f"```json\n{payload}\n```"
     parsed = parse_agent_json(raw, IndustryFilterResult)

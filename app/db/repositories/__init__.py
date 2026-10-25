@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, func, or_, select, text, update
+from sqlalchemy import String, cast, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -430,28 +430,58 @@ class Repository:
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 
+    def _topic_boundary(self, session_id):
+        return (
+            select(UserQuestion.id, UserQuestion.created_at)
+            .where(
+                UserQuestion.session_id == session_id,
+                # Assigned only after acceptance; retained if generation later fails.
+                UserQuestion.context_relation.in_(["standalone", "ambiguous"]),
+            )
+            .order_by(UserQuestion.created_at.desc(), UserQuestion.id.desc())
+            .limit(1)
+            .subquery()
+        )
+
+    async def current_topic_root(self, session_id):
+        boundary = self._topic_boundary(session_id)
+        return (await self.session.execute(select(boundary.c.id))).scalar_one_or_none()
+
+    def _topic_scope(self, session_id):
+        boundary = self._topic_boundary(session_id)
+        root = select(boundary.c.id).scalar_subquery()
+        started = select(boundary.c.created_at).scalar_subquery()
+        # Conservatively exclude other rows tied with the boundary timestamp.
+        return (
+            or_(root.is_(None), UserQuestion.id == root, UserQuestion.created_at > started),
+            or_(
+                UserQuestion.context_relation.is_(None),
+                UserQuestion.context_relation != "expansion",
+                root.is_(None),
+                BotResponse.context_snapshot["topic_root_question_id"].astext == cast(root, String),
+            ),
+        )
+
     async def get_previous_qa_for_session(
         self, session_id: uuid.UUID
     ) -> tuple[UserQuestion | None, BotResponse | None]:
-        q_stmt = (
-            select(UserQuestion)
-            .where(UserQuestion.session_id == session_id, UserQuestion.status == "answered")
-            .order_by(UserQuestion.created_at.desc())
+        stmt = (
+            select(UserQuestion, BotResponse)
+            .join(BotResponse, BotResponse.question_id == UserQuestion.id)
+            .where(
+                UserQuestion.session_id == session_id,
+                UserQuestion.status == "answered",
+                or_(
+                    UserQuestion.context_relation.is_(None),
+                    UserQuestion.context_relation != "expansion",
+                ),
+                *self._topic_scope(session_id),
+            )
+            .order_by(UserQuestion.created_at.desc(), BotResponse.created_at.desc())
             .limit(1)
         )
-        q_result = await self.session.execute(q_stmt)
-        question = q_result.scalar_one_or_none()
-        if question is None:
-            return None, None
-        r_stmt = (
-            select(BotResponse)
-            .where(BotResponse.question_id == question.id)
-            .order_by(BotResponse.created_at.desc())
-            .limit(1)
-        )
-        r_result = await self.session.execute(r_stmt)
-        response = r_result.scalar_one_or_none()
-        return question, response
+        row = (await self.session.execute(stmt)).first()
+        return (row[0], row[1]) if row else (None, None)
 
     async def get_recent_qa_for_session(
         self, session_id: uuid.UUID, *, limit: int
@@ -459,7 +489,11 @@ class Repository:
         stmt = (
             select(UserQuestion, BotResponse)
             .join(BotResponse, BotResponse.question_id == UserQuestion.id)
-            .where(UserQuestion.session_id == session_id, UserQuestion.status == "answered")
+            .where(
+                UserQuestion.session_id == session_id,
+                UserQuestion.status == "answered",
+                *self._topic_scope(session_id),
+            )
             .order_by(UserQuestion.created_at.desc())
             .limit(limit)
         )

@@ -3,7 +3,7 @@
 import hashlib
 import re
 from functools import lru_cache
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from pydantic import Field, field_validator, model_validator
@@ -92,7 +92,9 @@ class Settings(BaseSettings):
     private_context_turns: int = 6
     private_memory_max_chars: int = 6000
     knowledge_base_version: str = "1"
-    prompt_version: str = "4"
+    prompt_version: str = "5"
+    timeweb_prompt_source: Literal["local", "panel"] = "local"
+    timeweb_panel_prompt_set_version: str = ""
     answer_expansion_credits: int = Field(default=4, ge=1)
     recommendations_enabled: bool = True
     courses_url: str = "https://t.me/ferm2bot"

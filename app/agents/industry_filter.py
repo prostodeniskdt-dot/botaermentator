@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from pathlib import Path
 
 from app.agents.base import AgentParseError, parse_agent_json
+from app.agents.prompt_set import approved_path, load_prompt
 from app.agents.schemas import IndustryFilterResult
 from app.agents.timeweb_client import TimewebClient, TimewebClientError
 from app.config import Settings
@@ -16,7 +16,7 @@ from app.logging import get_logger
 
 logger = get_logger(__name__)
 
-PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "agent_1_industry_filter.md"
+PROMPT_PATH = approved_path(1)
 
 
 class IndustryFilterAgent:
@@ -25,7 +25,7 @@ class IndustryFilterAgent:
     def __init__(self, settings: Settings, client: TimewebClient) -> None:
         self.settings = settings
         self.client = client
-        self._prompt = PROMPT_PATH.read_text(encoding="utf-8") if PROMPT_PATH.exists() else ""
+        self._prompt = load_prompt(1, settings)
 
     async def evaluate(
         self,
@@ -34,8 +34,15 @@ class IndustryFilterAgent:
         question: str,
         session_id,
         question_id,
+        is_ambiguous_followup: bool = False,
     ) -> IndustryFilterResult | None:
         message = f"{self._prompt}\n\nUser question:\n{question}"
+        if is_ambiguous_followup:
+            message += (
+                "\n\nRequest context: an ambiguous follow-up in a food-technology dialogue. "
+                "Do not invent its subject; ambiguity alone is not junk. "
+                "Apply all topic and protection rules to the current message."
+            )
         started = datetime.now(UTC)
         try:
             await repo.before_external()
@@ -54,7 +61,7 @@ class IndustryFilterAgent:
                 agent_id=self.settings.timeweb_agent_1_id,
                 token=self.settings.timeweb_agent_1_token,
                 message=(
-                    f"{self._prompt}\n\nUser question:\n{question}\n\n"
+                    f"{message}\n\n"
                     "Your previous response was invalid. Return ONLY valid JSON matching "
                     "the requested schema."
                 ),

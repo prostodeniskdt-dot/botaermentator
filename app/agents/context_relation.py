@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from pathlib import Path
 
 from app.agents.base import AgentParseError, parse_agent_json
+from app.agents.prompt_set import approved_path, load_prompt
 from app.agents.schemas import ContextRelationResult
 from app.agents.timeweb_client import TimewebClient, TimewebClientError
 from app.config import Settings
@@ -16,7 +16,7 @@ from app.logging import get_logger
 
 logger = get_logger(__name__)
 
-PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "agent_2_context_relation.md"
+PROMPT_PATH = approved_path(2)
 
 
 class ContextRelationAgent:
@@ -25,7 +25,7 @@ class ContextRelationAgent:
     def __init__(self, settings: Settings, client: TimewebClient) -> None:
         self.settings = settings
         self.client = client
-        self._prompt = PROMPT_PATH.read_text(encoding="utf-8") if PROMPT_PATH.exists() else ""
+        self._prompt = load_prompt(2, settings)
 
     async def evaluate(
         self,

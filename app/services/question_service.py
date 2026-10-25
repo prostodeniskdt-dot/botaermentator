@@ -18,6 +18,7 @@ from structlog.contextvars import bound_contextvars
 from app.agents.context_relation import ContextRelationAgent
 from app.agents.industry_filter import IndustryFilterAgent
 from app.agents.main_expert import MainExpertAgent
+from app.agents.prompt_set import PROMPT_SET_VERSION, prompt_cache_version
 from app.bot.formatting.telegram_html import format_response_html
 from app.bot.keyboards import private_menu_keyboard
 from app.bot.mention import AddressKind
@@ -265,24 +266,42 @@ class QuestionService:
                     session_id=session.id,
                     question_id=question.id,
                 )
-                if not is_private and relation.relation == "standalone":
+                if not is_private and relation.relation != "related":
                     session = await self.session_service.create_new_session(repo, message)
                     question.session_id = session.id
-            contextual = bool(relation and relation.include_previous_context)
+            contextual = bool(
+                relation and relation.relation == "related" and relation.include_previous_context
+            )
             history, memory = [], None
             summary = None
             previous_question = previous_answer = None
             if is_private:
-                history, memory = await self._load_private_context(
-                    repo, session.id, user_id, has_summary=bool(session.summary)
-                )
-                summary = session.summary
+                facts = (user.profile_facts if user else {}).get("confirmed", [])
+                memory = "\n".join(f"- {fact}" for fact in facts) or None
+                if contextual:
+                    prior_snapshot = prev_a.context_snapshot or {}
+                    if prior_snapshot.get("prompt_set_version") == PROMPT_SET_VERSION:
+                        summary = prior_snapshot.get("summary_after")
+                        history, memory = await self._load_private_context(
+                            repo, session.id, user_id, has_summary=bool(summary)
+                        )
+                    else:
+                        # Legacy summaries may mix topics; begin with the last known exchange.
+                        history = [
+                            (
+                                self._clip_context_text(prev_q.raw_question, 180),
+                                self._first_sentences(prev_a.response_text, 280),
+                            )
+                        ]
+                        summary = self._updated_private_summary(None, *history[0])
             elif contextual:
                 prev_q, prev_a = await repo.get_previous_qa_for_session(session.id)
                 if prev_q and prev_a:
                     previous_question = prev_q.normalized_question or prev_q.raw_question
                     previous_answer = self._first_sentences(prev_a.response_text, 1200)
-            cache_allowed = not (contextual or memory or summary or history or previous_answer)
+            cache_allowed = (relation is None or relation.relation == "standalone") and not (
+                contextual or memory or summary or history or previous_answer
+            )
             if await self._maybe_serve_cached_answer(
                 repo,
                 bot,
@@ -293,7 +312,7 @@ class QuestionService:
                 response_mode=response_mode,
                 allowed=cache_allowed,
                 session=session,
-                relation=relation.relation if relation else None,
+                relation=relation.relation if relation else "standalone",
                 level=level,
                 request_id=request_id,
                 question=question,
@@ -311,11 +330,15 @@ class QuestionService:
                 reserved_credits = reserved
             filter_question = (
                 relation.rewritten_question
-                if relation and relation.rewritten_question
+                if contextual and relation.rewritten_question
                 else gate_result.question_text
             )
             filter_result = await self.industry_filter.evaluate(
-                repo, question=filter_question, session_id=session.id, question_id=question.id
+                repo,
+                question=filter_question,
+                session_id=session.id,
+                question_id=question.id,
+                is_ambiguous_followup=bool(relation and relation.relation == "ambiguous"),
             )
             if filter_result is None:
                 await self._fail_closed(bot, message, question.id, session.id, repo)
@@ -346,6 +369,7 @@ class QuestionService:
                 await repo.before_external()
                 await self._reply_text(bot, message, OFF_TOPIC)
                 return
+            question.context_relation = str(relation.relation) if relation else "standalone"
             await self.notifications.start(repo, bot, message, request_id)
             result = await self.main_expert.answer(
                 repo,
@@ -360,6 +384,7 @@ class QuestionService:
                 user_memory=memory,
                 conversation_summary=summary,
                 knowledge_level=level,
+                context_relation=relation.relation if relation else "standalone",
             )
             if result is None or not result.text.strip():
                 await self._fail_closed(bot, message, question.id, session.id, repo)
@@ -375,11 +400,13 @@ class QuestionService:
                 text += "\n\nОтвет остановлен по лимиту генерации и может быть неполным."
             else:
                 text = recommend(gate_result.question_text, text, self.settings)
+            topic_root = await repo.current_topic_root(session.id) if contextual else question.id
             snapshot = {
                 "knowledge_level": str(level),
                 "history": history,
                 "summary": summary,
                 "user_memory": memory,
+                "topic_root_question_id": str(topic_root) if topic_root else None,
             }
             await self._persist_answer(
                 repo,
@@ -442,6 +469,13 @@ class QuestionService:
         response_status="answered",
     ):
         await repo.ensure_processing_lease()
+        snapshot = dict(snapshot or {})
+        summary_after = None
+        if message.chat.type == "private":
+            summary_after = self._updated_private_summary(
+                snapshot.get("summary"), question.raw_question, text
+            )
+            snapshot.update(prompt_set_version=PROMPT_SET_VERSION, summary_after=summary_after)
         if self.settings.store_bot_responses:
             response = await repo.create_bot_response(
                 session_id=session.id,
@@ -450,7 +484,7 @@ class QuestionService:
                 timeweb_response_id=response_id,
                 status="delivery_pending",
             )
-            response.context_snapshot = snapshot or {}
+            response.context_snapshot = snapshot
             await repo.enqueue_delivery(
                 response.id,
                 question.id,
@@ -469,11 +503,8 @@ class QuestionService:
             await self.credit_service.commit(repo, user_id, question.request_id, reserved_credits)
             await repo.set_question_credits_charged(question.id, reserved_credits)
         question.status = response_status
-        if message.chat.type == "private":
-            await repo.update_session_summary(
-                session.id,
-                self._updated_private_summary(session.summary, question.raw_question, text),
-            )
+        if summary_after is not None and question.context_relation != "expansion":
+            await repo.update_session_summary(session.id, summary_after)
 
     _HISTORY_QUESTION_MAX_CHARS = 180
     _HISTORY_ANSWER_MAX_CHARS = 280
@@ -657,7 +688,7 @@ class QuestionService:
         normalized = normalize_question_key(question_text)
         return (
             f"{self.settings.knowledge_base_version}:"
-            f"{self.settings.prompt_version}:cache2:{str(mode)}:{level}:{normalized}"
+            f"{prompt_cache_version(self.settings)}:cache2:{str(mode)}:{level}:{normalized}"
         )
 
     async def deliver_job(self, bot: Bot, job):
@@ -700,6 +731,7 @@ class QuestionService:
                 and question
                 and question.response_mode == ResponseMode.QUICK
                 and question.status == "answered"
+                and question.context_relation != "ambiguous"
                 and session
                 and session.closed_at is None
             ):
@@ -813,6 +845,7 @@ class QuestionService:
         )
         if relation:
             await repo.update_question_context_relation(question.id, relation)
+        question.context_relation = relation or "standalone"
         await self.notifications.start(repo, bot, message, question.request_id)
         text = recommend(question_text, cached.answer_text, self.settings)
         await self._persist_answer(
@@ -822,7 +855,7 @@ class QuestionService:
             session,
             question,
             text=text,
-            snapshot={"knowledge_level": str(level)},
+            snapshot={"knowledge_level": str(level), "topic_root_question_id": str(question.id)},
             user_id=user_id,
         )
         await repo.record_cache_hit(cache_key)

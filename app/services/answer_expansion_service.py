@@ -80,6 +80,7 @@ class AnswerExpansionService:
                     response_mode=ResponseMode.DEEP,
                 )
                 question.filter_allowed = True
+                question.context_relation = "expansion"
                 question.status = "processing"
                 offer.question_id = question.id
                 offer.status = "processing"

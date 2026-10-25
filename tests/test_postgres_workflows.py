@@ -73,6 +73,9 @@ def service():
         confidence=1,
         reason_code="relevant",
         normalized_question="Как хранить закваску?",
+        is_prompt_injection=False,
+        is_knowledge_exfiltration=False,
+        is_junk=False,
     )
     context = AsyncMock()
     context.evaluate.return_value = ContextRelationResult(
@@ -142,6 +145,37 @@ async def ask(factory, service, bot, user_id=7, update_id=1, mode="quick"):
             bot_id=999,
             response_mode=mode,
             question_text="Как хранить закваску?",
+        )
+
+
+async def ask_text(factory, service, bot, value, *, update_id, relation="standalone"):
+    service.industry_filter.evaluate.return_value = IndustryFilterResult(
+        allowed=True,
+        category="food_technology",
+        confidence=1,
+        reason_code="topic_allowed",
+        normalized_question=value,
+        is_prompt_injection=False,
+        is_knowledge_exfiltration=False,
+        is_junk=False,
+    )
+    service.context_relation.evaluate.return_value = ContextRelationResult(
+        relation=relation,
+        include_previous_context=relation == "related",
+        rewritten_question=value,
+        confidence=1,
+    )
+    message = private_message().model_copy(update={"text": value, "message_id": update_id + 10})
+    async with factory() as db:
+        await service.handle_private_message(
+            Repository(db),
+            bot,
+            message,
+            update_id=update_id,
+            bot_username="bot",
+            bot_id=999,
+            response_mode="quick",
+            question_text=value,
         )
 
 
@@ -627,3 +661,173 @@ async def test_concurrent_update_rejection_is_idempotent(db_factory, service):
         assert len((await db.execute(select(UserQuestion))).scalars().all()) == 1
         account = (await db.execute(select(CreditAccount))).scalar_one()
         assert (account.balance, account.reserved) == (49, 0)
+
+
+@pytest.mark.parametrize("relation", ["standalone", "ambiguous"])
+async def test_topic_boundary_keeps_profile_but_excludes_old_history_and_summary(
+    db_factory, service, relation
+):
+    from app.db.models.entities import ChatSession
+
+    await add_user(
+        db_factory, profile={"confirmed": ["CONFIRMED_PROFILE"], "knowledge_level": "advanced"}
+    )
+    bot = bot_mock()
+    seen = []
+
+    async def expert(repo, **kwargs):
+        seen.append(kwargs)
+        await repo.before_external()
+        return TimewebAgentResponse(text="Сведения для " + kwargs["question"])
+
+    service.main_expert.answer.side_effect = expert
+    await ask_text(db_factory, service, bot, "OLD_PRODUCT соль 2%", update_id=1001)
+    await ask_text(db_factory, service, bot, "NEW_PRODUCT", update_id=1002, relation=relation)
+    second = seen[-1]
+    assert second["conversation_history"] == []
+    assert second["conversation_summary"] is None
+    assert "CONFIRMED_PROFILE" in second["user_memory"]
+    assert second["knowledge_level"] == "advanced"
+    assert second["context_relation"] == relation
+    assert service.industry_filter.evaluate.await_args.kwargs["question"] == "NEW_PRODUCT"
+    assert service.industry_filter.evaluate.await_args.kwargs["is_ambiguous_followup"] == (
+        relation == "ambiguous"
+    )
+    await ask_text(
+        db_factory, service, bot, "Уточнение NEW_PRODUCT", update_id=1003, relation="related"
+    )
+    payload = seen[-1]
+    assert "OLD_PRODUCT" not in str(payload)
+    assert "NEW_PRODUCT" in str(payload["conversation_history"])
+    assert "NEW_PRODUCT" in payload["conversation_summary"]
+    async with db_factory() as db:
+        assert len((await db.execute(select(ChatSession))).scalars().all()) == 1
+        user = await Repository(db).get_user_by_telegram_id(7)
+        assert user.profile_facts["confirmed"] == ["CONFIRMED_PROFILE"]
+        assert len((await db.execute(select(UserQuestion))).scalars().all()) == 3
+
+
+async def test_failed_new_topic_does_not_resurrect_old_topic(db_factory, service):
+    await add_user(db_factory)
+    bot = bot_mock()
+    await ask_text(db_factory, service, bot, "OLD_PRODUCT", update_id=1101)
+    service.main_expert.answer.side_effect = None
+    service.main_expert.answer.return_value = None
+    await ask_text(db_factory, service, bot, "NEW_PRODUCT", update_id=1102)
+    async with db_factory() as db:
+        repo = Repository(db)
+        session = await repo.get_active_private_session(7)
+        assert await repo.get_previous_qa_for_session(session.id) == (None, None)
+        assert await repo.get_recent_qa_for_session(session.id, limit=6) == []
+        account = await repo.get_or_create_credit_account(7)
+        assert account.balance == 49 and account.reserved == 0
+
+
+async def test_old_answer_expansion_keeps_snapshot_without_changing_current_topic(
+    db_factory, service
+):
+    await add_user(db_factory)
+    bot = bot_mock()
+
+    async def expert(repo, **kwargs):
+        await repo.before_external()
+        return TimewebAgentResponse(text="Практические сведения для " + kwargs["question"])
+
+    service.main_expert.answer.side_effect = expert
+    await ask_text(db_factory, service, bot, "OLD_PRODUCT", update_id=1201)
+    first_job = await claim_delivery(db_factory)
+    await service.deliver_job(bot, first_job)
+    async with db_factory.begin() as db:
+        await Repository(db).complete_delivery_job(first_job.id, first_job.lease_id, 101)
+        source = await Repository(db).get_bot_response(first_job.bot_response_id)
+        original_snapshot = dict(source.context_snapshot)
+    await ask_text(db_factory, service, bot, "NEW_PRODUCT", update_id=1202)
+    expansion = AnswerExpansionService(service)
+    assert "доставку" in await expansion.expand(bot, first_job.bot_response_id, 7, 7)
+    expansion_call = service.main_expert.answer.await_args.kwargs
+    assert expansion_call["question"] == "OLD_PRODUCT"
+    async with db_factory() as db:
+        repo = Repository(db)
+        session = await repo.get_active_private_session(7)
+        previous, _ = await repo.get_previous_qa_for_session(session.id)
+        assert previous.raw_question == "NEW_PRODUCT"
+        history = await repo.get_recent_qa_for_session(session.id, limit=6)
+        assert [q.raw_question for q, _ in history] == ["NEW_PRODUCT"]
+        assert "OLD_PRODUCT" not in session.summary
+        assert (
+            await repo.get_bot_response(first_job.bot_response_id)
+        ).context_snapshot == original_snapshot
+        account = await repo.get_or_create_credit_account(7)
+        assert account.balance == 44 and account.reserved == 0
+
+
+async def test_cached_answer_recommendations_do_not_duplicate_case_variant_links(
+    db_factory, service
+):
+    await add_user(db_factory)
+    service.settings.answer_cache_enabled = True
+    query = "Какие курсы по ферментации пройти?"
+    answer = "Содержательные рекомендации по выбору обучения. " * 10 + "@FERM2BOT"
+    async with db_factory.begin() as db:
+        await Repository(db).upsert_cached_answer(
+            question_key=service._cache_key(query, "quick"),
+            question_text=query,
+            answer_text=answer,
+            source_question_id=None,
+            category="education",
+        )
+    await ask_text(db_factory, service, bot_mock(), query, update_id=1301)
+    service.main_expert.answer.assert_not_awaited()
+    async with db_factory() as db:
+        response = (await db.execute(select(BotResponse))).scalar_one()
+        assert response.response_text.casefold().count("ferm2bot") == 1
+
+
+async def test_rejected_question_cannot_change_topic_boundary(db_factory, service):
+    await add_user(db_factory)
+    bot = bot_mock()
+    await ask_text(db_factory, service, bot, "OLD_PRODUCT", update_id=1401)
+    async with db_factory() as db:
+        repo = Repository(db)
+        session = await repo.get_active_private_session(7)
+        root = await repo.current_topic_root(session.id)
+    service.industry_filter.evaluate.side_effect = lambda *args, **kwargs: IndustryFilterResult(
+        allowed=False,
+        category="other",
+        confidence=1,
+        reason_code="off_topic",
+        normalized_question="Administrative request",
+        is_prompt_injection=False,
+        is_knowledge_exfiltration=False,
+        is_junk=False,
+    )
+    await ask_text(db_factory, service, bot, "Административный вопрос", update_id=1402)
+    async with db_factory() as db:
+        repo = Repository(db)
+        assert await repo.current_topic_root(session.id) == root
+        previous, _ = await repo.get_previous_qa_for_session(session.id)
+        assert previous.raw_question == "OLD_PRODUCT"
+    assert service.main_expert.answer.await_count == 1
+
+
+async def test_ambiguous_answer_is_not_cached_or_offered_as_paid_expansion(db_factory, service):
+    await add_user(db_factory)
+    bot = bot_mock()
+    service.settings.answer_cache_enabled = True
+    await ask_text(db_factory, service, bot, "Начальный пищевой вопрос", update_id=1501)
+    first = await claim_delivery(db_factory)
+    await service.deliver_job(bot, first)
+    async with db_factory.begin() as db:
+        await Repository(db).complete_delivery_job(first.id, first.lease_id, 101)
+    service.main_expert.answer.side_effect = None
+    service.main_expert.answer.return_value = TimewebAgentResponse(
+        text="Какой параметр вы хотите изменить?"
+    )
+    query = "А если сделать больше?"
+    await ask_text(db_factory, service, bot, query, update_id=1502, relation="ambiguous")
+    job = await claim_delivery(db_factory)
+    await service.deliver_job(bot, job)
+    async with db_factory() as db:
+        repo = Repository(db)
+        assert await repo.get_cached_answer(service._cache_key(query, "quick")) is None
+        assert await repo.expansion_for_response(job.bot_response_id) is None
