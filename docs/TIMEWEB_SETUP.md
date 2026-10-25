@@ -21,6 +21,12 @@ Create three Cloud AI agents:
 
 Upload author materials to the Agent 3 knowledge base (text-layer PDFs or Markdown).
 
+Approved prompt texts, their version and source selection: [TIMEWEB_AGENT_PROMPTS.md](TIMEWEB_AGENT_PROMPTS.md).
+Default `TIMEWEB_PROMPT_SOURCE=local` retains the complete approved instructions in the request.
+Only after manually verifying all panel copies and supported API transports may an operator select
+`panel` with `TIMEWEB_PANEL_PROMPT_SET_VERSION=2026-10-25.1`. No panel edits or deployment are performed
+by the synchronization tools. Live KB/search behavior still requires a test-agent check.
+
 ## 3. API keys
 
 Create separate API tokens for each agent and set:

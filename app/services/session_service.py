@@ -33,7 +33,7 @@ class SessionService:
         repo: Repository,
         message: Message,
         *,
-        context_agent: ContextRelationAgent,
+        context_agent: ContextRelationAgent | None,
     ) -> tuple[object, ContextRelationResult | None]:
         user_id = message.from_user.id  # type: ignore[union-attr]
         session = await repo.get_active_private_session(user_id)
@@ -62,7 +62,7 @@ class SessionService:
         message: Message,
         *,
         bot_id: int,
-        context_agent: ContextRelationAgent,
+        context_agent: ContextRelationAgent | None,
         question_id: uuid.UUID | None = None,
     ) -> tuple[object, ContextRelationResult | None]:
         reply = message.reply_to_message
@@ -110,8 +110,5 @@ class SessionService:
 
         if relation.relation == ContextRelation.RELATED:
             return prev_session, relation
-        if relation.relation == ContextRelation.AMBIGUOUS:
-            return prev_session, relation
-
         session = await self.create_new_session(repo, message)
         return session, relation

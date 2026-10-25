@@ -126,15 +126,11 @@ def test_level_cache_separation_and_unknown_default(settings):
     assert knowledge_level({}) == KnowledgeLevel.DEFAULT
 
 
-def test_expert_prompt_only_allowed_positioning_change():
-    # The safety block is deliberately pinned to its existing text.
-    safety = PROMPT_PATH.read_text().split("## Безопасность\n", 1)[1].strip()
-    assert safety == (
-        "Для мяса, рыбы, молочных продуктов, плесени, анаэробных процессов и длительного "
-        "хранения указывай измеримые условия контроля.\n"
-        "Не определяй безопасность только по вкусу, запаху, цвету или фотографии.\n"
-        "Не советуй пробовать сомнительный продукт."
-    )
+def test_approved_expert_safety_rules():
+    safety = PROMPT_PATH.read_text().split("## ПИЩЕВАЯ БЕЗОПАСНОСТЬ\n", 1)[1]
+    assert "Не определяй безопасность только по вкусу, запаху, цвету или фотографии." in safety
+    assert "Не советуй пробовать сомнительный продукт." in safety
+    assert "Снижение pH само по себе не гарантирует безопасность." in safety
 
 
 async def test_context_classifier_receives_bounded_prior_deep_answer(settings):

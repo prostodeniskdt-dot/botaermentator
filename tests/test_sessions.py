@@ -80,7 +80,8 @@ async def test_related_reply_keeps_session():
 
 
 @pytest.mark.asyncio
-async def test_standalone_reply_new_session():
+@pytest.mark.parametrize("relation_value", [ContextRelation.STANDALONE, ContextRelation.AMBIGUOUS])
+async def test_unrelated_reply_new_session(relation_value):
     session_id = uuid.uuid4()
     prev_session = MagicMock(id=session_id, telegram_user_id=7, message_thread_id=None)
     new_session = MagicMock(id=uuid.uuid4())
@@ -96,7 +97,7 @@ async def test_standalone_reply_new_session():
 
     context_agent = AsyncMock()
     context_agent.evaluate.return_value = ContextRelationResult(
-        relation=ContextRelation.STANDALONE,
+        relation=relation_value,
         include_previous_context=False,
         rewritten_question="new q",
         confidence=0.9,

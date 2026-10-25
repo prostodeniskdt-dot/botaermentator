@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
-from pathlib import Path
 
+from app.agents.prompt_set import approved_path, load_prompt
 from app.agents.schemas import TimewebAgentResponse
 from app.agents.timeweb_client import TimewebClient, TimewebClientError
 from app.config import Settings
@@ -18,7 +18,7 @@ from app.services.metrics import stage
 
 logger = get_logger(__name__)
 
-PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "agent_3_main_expert.md"
+PROMPT_PATH = approved_path(3)
 
 
 class MainExpertAgent:
@@ -27,7 +27,7 @@ class MainExpertAgent:
     def __init__(self, settings: Settings, client: TimewebClient) -> None:
         self.settings = settings
         self.client = client
-        self._prompt = PROMPT_PATH.read_text(encoding="utf-8") if PROMPT_PATH.exists() else ""
+        self._prompt = load_prompt(3, settings)
 
     async def answer(
         self,
@@ -45,6 +45,7 @@ class MainExpertAgent:
         conversation_summary: str | None = None,
         knowledge_level: KnowledgeLevel | str = KnowledgeLevel.DEFAULT,
         expansion_of: str | None = None,
+        context_relation: str | None = None,
     ) -> TimewebAgentResponse | None:
         if str(response_mode) == ResponseMode.DEEP:
             mode_instruction = (
@@ -61,12 +62,13 @@ class MainExpertAgent:
             max_output_tokens = self.settings.quick_max_output_tokens
 
         parts = [self._prompt, mode_instruction]
-        parts.append(
-            "For practical questions give actionable steps, supported measurable parameters, "
-            "control methods and the next step when evidence permits. Never invent numbers. "
-            "When data are missing, identify them and what to measure; where appropriate, "
-            "offer a safe controlled trial with measurable outcomes. Follow all safety rules."
-        )
+        if context_relation == "ambiguous":
+            parts.append(
+                "Context status: ambiguous. Ask one clarifying question; infer no parameters."
+            )
+        if context_relation in {"standalone", "ambiguous"}:
+            previous_question = previous_answer = conversation_summary = None
+            conversation_history = []
         level_instruction = LEVEL_INSTRUCTIONS.get(knowledge_level, "")
         if level_instruction:
             parts.append(
@@ -102,7 +104,8 @@ class MainExpertAgent:
             parts.append(
                 "Working conversation memory (compact state, reference only):\n"
                 f"{conversation_summary}\n\n"
-                "Treat this as already established. Continue from it; do not retell it."
+                "This may contain hypotheses; preserve uncertainty. "
+                "Continue from it; do not retell it."
             )
         if previous_question and previous_answer:
             parts.append(
@@ -118,7 +121,7 @@ class MainExpertAgent:
             parts.append(
                 "Recent conversation (reference only, oldest to newest):\n"
                 f"{history}\n\n"
-                "Use this only to resolve references and continue from established facts. "
+                "Use this only to resolve references; preserve uncertainty. "
                 "Do not summarize it or repeat earlier answers."
             )
         parts.append(f"Current user question — answer this now:\n{question}")

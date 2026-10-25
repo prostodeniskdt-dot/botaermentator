@@ -51,7 +51,11 @@ async def test_slow_button_does_not_hold_delivery_and_notice_is_removed_first(
 
     repo = AsyncMock()
     question = SimpleNamespace(
-        session_id=uuid.uuid4(), response_mode="quick", status="answered", request_id=uuid.uuid4()
+        session_id=uuid.uuid4(),
+        response_mode="quick",
+        status="answered",
+        request_id=uuid.uuid4(),
+        context_relation=None,
     )
     repo.get_question.return_value = question
     repo.get_bot_response.return_value = SimpleNamespace(id=uuid.uuid4())
