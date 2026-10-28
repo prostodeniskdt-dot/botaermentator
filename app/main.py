@@ -151,7 +151,8 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
             heartbeat_seconds=settings.update_queue_heartbeat_seconds,
             delivery_handler=partial(question_service.deliver_job, bot),
             concurrency=settings.update_queue_concurrency,
-            enable_updates=settings.durable_update_queue_enabled,
+            delivery_concurrency=settings.delivery_queue_concurrency,
+            enable_updates=settings.use_durable_update_queue,
             maintenance_handler=partial(question_service.notifications.cleanup, bot),
             delivery_failure_handler=partial(question_service.on_delivery_failed, bot),
         )

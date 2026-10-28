@@ -21,6 +21,21 @@ def _is_admin(message: Message, settings) -> bool:
     return bool(message.from_user and message.from_user.id in settings.admin_user_ids)
 
 
+@router.message(F.chat.type == "private", Command("admin_latency"))
+async def admin_latency(message: Message, settings) -> None:
+    if not _is_admin(message, settings):
+        return
+    from app.services.latency_report import latency_report
+
+    async with session_scope() as db:
+        report = await latency_report(db, message.from_user.id)
+    queue_mode = (
+        "долговечная очередь" if settings.use_durable_update_queue else "синхронный webhook"
+    )
+    report = f"Обработка: {queue_mode}.\n\n" + report
+    await message.answer(report, parse_mode=None)
+
+
 @router.message(F.chat.type == "private", Command("admin_status"))
 async def admin_status(message: Message, settings) -> None:
     if not _is_admin(message, settings):

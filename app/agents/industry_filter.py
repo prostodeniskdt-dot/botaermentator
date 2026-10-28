@@ -35,12 +35,19 @@ class IndustryFilterAgent:
         session_id,
         question_id,
         is_ambiguous_followup: bool = False,
+        has_previous_food_context: bool = False,
     ) -> IndustryFilterResult | None:
         message = f"{self._prompt}\n\nUser question:\n{question}"
         if is_ambiguous_followup:
             message += (
                 "\n\nRequest context: an ambiguous follow-up in a food-technology dialogue. "
                 "Do not invent its subject; ambiguity alone is not junk. "
+                "Apply all topic and protection rules to the current message."
+            )
+        elif has_previous_food_context:
+            message += (
+                "\n\nRequest context: a previously accepted food-technology exchange exists. "
+                "A short follow-up can be on-topic; do not infer its missing subject or values. "
                 "Apply all topic and protection rules to the current message."
             )
         started = datetime.now(UTC)
@@ -56,6 +63,7 @@ class IndustryFilterAgent:
             if parsed is not None:
                 return parsed
             retry_started = datetime.now(UTC)
+            started = retry_started
             await repo.before_external()
             retry = await self.client.call_agent(
                 agent_id=self.settings.timeweb_agent_1_id,
@@ -121,6 +129,7 @@ class IndustryFilterAgent:
             actual_cost_rub=getattr(call, "actual_cost_rub", None),
             estimated_cost_rub=self.settings.agent_1_estimated_cost_rub,
             transport=getattr(call, "transport", None),
+            model_name=getattr(call, "model_name", None),
             attempt_number=getattr(call, "attempt_number", 1),
             error_code=error_code,
         )

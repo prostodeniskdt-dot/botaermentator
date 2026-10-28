@@ -7,6 +7,8 @@ from urllib.parse import urlparse
 
 from markdown_it import MarkdownIt
 
+from app.bot.formatting.telegram_rich import prep_rich_markdown
+
 MAX_PART_LENGTH = 3800
 _TOKENS = re.compile(r"<[^>]*>|&(?:#\d+|#x[\da-fA-F]+|\w+);|[^<&]+|[<&]")
 _ALLOWED = {"b", "i", "u", "s", "code", "pre", "a"}
@@ -26,14 +28,54 @@ class _Sanitizer(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.parts = []
         self.stack = []
+        self.lists = []
+        self.pending_breaks = 0
+        self.after_marker = False
+
+    def _emit(self, value):
+        if self.pending_breaks:
+            if self.parts:
+                trailing = 0
+                for part in reversed(self.parts):
+                    if part.startswith("</") and part.endswith(">"):
+                        continue
+                    trailing += len(part) - len(part.rstrip("\n"))
+                    if part.strip("\n"):
+                        break
+                self.parts.append("\n" * max(0, min(self.pending_breaks, 2) - trailing))
+            self.pending_breaks = 0
+        self.parts.append(value)
 
     def handle_starttag(self, tag, attrs):
         tag = _ALIASES.get(tag, tag)
-        if tag == "br":
-            self.parts.append("\n")
-        elif tag in {"p", "li", "tr", "h1", "h2", "h3", "blockquote"}:
-            self.parts.append("\n" + ("• " if tag == "li" else ""))
+        if tag in {"ul", "ol"}:
+            self.pending_breaks = 1 if self.lists else 2
+            try:
+                start = int(dict(attrs).get("start", "1"))
+            except (TypeError, ValueError):
+                start = 1
+            self.lists.append({"ordered": tag == "ol", "next": start, "first": True})
+        elif tag == "li":
+            listing = self.lists[-1] if self.lists else None
+            if listing:
+                if not listing["first"]:
+                    self.pending_breaks = 1
+                listing["first"] = False
+                marker = f"{listing['next']}. " if listing["ordered"] else "• "
+                listing["next"] += 1
+            else:
+                self.pending_breaks = 1
+                marker = "• "
+            self._emit("  " * max(len(self.lists) - 1, 0) + marker)
+            self.after_marker = True
+        elif tag == "br":
+            self.pending_breaks = max(self.pending_breaks, 1)
+        elif tag in {"p", "div", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote"}:
+            if not self.after_marker:
+                self.pending_breaks = max(self.pending_breaks, 2)
         elif tag in _ALLOWED:
+            if tag == "pre":
+                self.pending_breaks = max(self.pending_breaks, 2)
             opening = f"<{tag}>"
             if tag == "a":
                 href = dict(attrs).get("href") or ""
@@ -43,7 +85,7 @@ class _Sanitizer(HTMLParser):
                 ):
                     return
                 opening = f'<a href="{html.escape(href, quote=True)}">'
-            self.parts.append(opening)
+            self._emit(opening)
             self.stack.append(tag)
 
     def handle_endtag(self, tag):
@@ -54,11 +96,34 @@ class _Sanitizer(HTMLParser):
                 self.parts.append(f"</{current}>")
                 if current == tag:
                     break
-        elif tag in {"p", "li", "tr", "h1", "h2", "h3", "blockquote"}:
-            self.parts.append("\n")
+            if tag == "pre":
+                self.pending_breaks = 2
+        elif tag in {"ul", "ol"}:
+            if self.lists:
+                self.lists.pop()
+            self.pending_breaks = 1 if self.lists else 2
+            self.after_marker = False
+        elif tag == "li":
+            self.pending_breaks = 1
+            self.after_marker = False
+        elif tag in {"p", "div", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote"}:
+            self.pending_breaks = 2
 
     def handle_data(self, data):
-        self.parts.append(escape_html(data))
+        if "pre" in self.stack or "code" in self.stack:
+            self._emit(escape_html(data))
+            return
+        # HTML renderer indentation/newlines are structure, not extra paragraphs.
+        if not data.strip() and ("\n" in data or self.after_marker or self.pending_breaks):
+            return
+        value = re.sub(r"[ \t\u00a0]+", " ", data)
+        value = re.sub(r"\n{3,}", "\n\n", value)
+        if self.pending_breaks or self.after_marker:
+            value = value.lstrip(" \r\n")
+        if not value:
+            return
+        self._emit(escape_html(value))
+        self.after_marker = False
 
 
 def sanitize_html(text: str) -> str:
@@ -69,7 +134,8 @@ def sanitize_html(text: str) -> str:
 
 
 def format_response_html(text: str) -> str:
-    if "<" in text and ">" in text:
+    text = prep_rich_markdown(text)
+    if re.search(r"</?[a-zA-Z][a-zA-Z0-9]*(?:\s[^<>]*|/?)>", text):
         return sanitize_html(text)
     rendered = MarkdownIt("commonmark", {"html": False}).render(text)
     return sanitize_html(rendered).strip()
@@ -106,11 +172,27 @@ def split_html_message(text: str, max_len: int = MAX_PART_LENGTH) -> list[str]:
                 current += token
                 stack.append((name, token))
             continue
-        units = [token] if token.startswith("&") and token.endswith(";") else token
+        units = (
+            [token]
+            if token.startswith("&") and token.endswith(";")
+            else re.findall(r"\S+|\s+", token)
+        )
         for unit in units:
-            if utf16_length(current + unit + close_tags()) > max_len:
+            if utf16_length(current + unit + close_tags()) <= max_len:
+                current += unit
+                continue
+            # Move a whole word to the next message whenever it fits there.
+            reopened = "".join(opening for _, opening in stack)
+            if utf16_length(reopened + unit + close_tags()) <= max_len:
                 flush()
-            current += unit
+                current += unit
+                continue
+            # Only genuinely oversized words/whitespace runs need character splitting.
+            # Entities are indivisible and always fit the minimum supported budget.
+            for character in unit:
+                if utf16_length(current + character + close_tags()) > max_len:
+                    flush()
+                current += character
     if current:
         parts.append(current + close_tags())
     return parts or [""]

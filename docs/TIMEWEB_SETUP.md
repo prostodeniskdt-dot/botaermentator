@@ -128,6 +128,7 @@ configure Group Privacy consistently with the group scenario and test it before 
 - `/admin_block_user <telegram_user_id> <reason>`
 - `/admin_unblock_user <telegram_user_id>`
 - `/admin_cost_today`
+- `/admin_latency` — timings of your last three requests, including queue/receipt, model and delivery
 - `/admin_kill_switch_on` / `/admin_kill_switch_off`
 
 Credits are internal accounting units. There is no payment or Telegram Stars integration.
@@ -143,8 +144,13 @@ No production deployment is performed automatically by this change.
 New non-secret settings are documented in `.env.example`. Start with UPDATE_QUEUE_CONCURRENCY=2 per
 process; reserve database connections for service commands, delivery and heartbeat. Account for the
 number of application processes when checking provider and database capacity. Delivery and notice
-maintenance also run when durable update enqueueing is disabled.
+maintenance have separate workers. With DATABASE_URL configured, webhook updates are always queued
+before processing, including when an old environment still sets DURABLE_UPDATE_QUEUE_ENABLED=false.
+The synchronous path is retained only for development without a database.
 
 Verify all Timeweb transports, actual KB attachment and response finish reasons on a test agent.
 Output defaults stay 600/2200 until larger limits are verified with the configured model. Do not
 claim a speedup from mock-test timings. Never blindly requeue a delivery with an unknown send outcome.
+
+See RESPONSE_SPEED_AND_LAYOUT.md for the current transport defaults, parallel classifiers, early
+receipt, formatting fixes and the `/admin_latency` diagnostic command.

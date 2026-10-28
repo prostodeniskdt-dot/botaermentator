@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import String, cast, delete, func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from app.db.models.entities import (
     AccessEvent,
@@ -768,9 +769,37 @@ class Repository:
     ) -> TelegramDeliveryJob | None:
         now = datetime.now(UTC)
         stale_before = now - timedelta(seconds=stale_after_seconds)
+        other = aliased(TelegramDeliveryJob)
+        # Different chats can be delivered independently. The oldest unfinished job
+        # in one chat stays first, including during backoff and stale-lease recovery.
+        older_in_chat = (
+            select(other.id)
+            .where(
+                other.chat_id == TelegramDeliveryJob.chat_id,
+                other.status.in_(["pending", "processing"]),
+                or_(
+                    other.created_at < TelegramDeliveryJob.created_at,
+                    (other.created_at == TelegramDeliveryJob.created_at)
+                    & (other.id < TelegramDeliveryJob.id),
+                ),
+            )
+            .exists()
+        )
+        active_in_chat = (
+            select(other.id)
+            .where(
+                other.chat_id == TelegramDeliveryJob.chat_id,
+                other.id != TelegramDeliveryJob.id,
+                other.status == "processing",
+                other.locked_at >= stale_before,
+            )
+            .exists()
+        )
         result = await self.session.execute(
             select(TelegramDeliveryJob)
             .where(
+                ~older_in_chat,
+                ~active_in_chat,
                 or_(
                     (
                         (TelegramDeliveryJob.status == "pending")
@@ -780,9 +809,9 @@ class Repository:
                         (TelegramDeliveryJob.status == "processing")
                         & (TelegramDeliveryJob.locked_at < stale_before)
                     ),
-                )
+                ),
             )
-            .order_by(TelegramDeliveryJob.created_at)
+            .order_by(TelegramDeliveryJob.created_at, TelegramDeliveryJob.id)
             .with_for_update(skip_locked=True)
             .limit(1)
         )

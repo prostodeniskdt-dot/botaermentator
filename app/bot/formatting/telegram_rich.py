@@ -8,7 +8,7 @@ import re
 MAX_RICH_PART_LENGTH = 30_000
 
 _FENCE_RE = re.compile(
-    r"^\s*```(?:markdown|md|gfm)?\s*\n(?P<body>.*?)\n```\s*$",
+    r"^\s*```(?:markdown|md|gfm)\s*\n(?P<body>.*?)\n```\s*$",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -23,8 +23,16 @@ def prep_rich_markdown(text: str) -> str:
     if match:
         value = match.group("body").strip()
 
-    # Collapse 3+ blank lines so structure stays tight.
-    value = re.sub(r"\n{3,}", "\n\n", value)
+    # Normalize prose only; blank lines and indentation in fenced code are data.
+    blocks = re.split(
+        r"(^[ \t]*(?:`{3,}|~{3,})[^\n]*\n.*?^[ \t]*(?:`{3,}|~{3,})[ \t]*$)",
+        value,
+        flags=re.M | re.S,
+    )
+    for index in range(0, len(blocks), 2):
+        blocks[index] = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", blocks[index])
+        blocks[index] = re.sub(r"(?m)^([ \t]*[•*-])[ \t]*\n+(?=\S)", r"\1 ", blocks[index])
+    value = "".join(blocks)
     return value.strip()
 
 

@@ -44,7 +44,7 @@ from app.services.processing_lease import processing_lease
 from app.services.recommendations import recommend
 from app.services.request_gate import GateOutcome, RequestGate
 from app.services.session_service import SessionService
-from app.services.task_notification_service import TaskNotificationService
+from app.services.task_notification_service import RECEIVED, TaskNotificationService
 
 logger = get_logger(__name__)
 
@@ -256,16 +256,49 @@ class QuestionService:
             )
             # Persist request identity before any AI call, including context classification.
             await repo.before_external()
+            # A receipt acknowledges transport, not topic approval.
+            # AI guards still precede generation.
+            await self.notifications.start(repo, bot, message, request_id, text=RECEIVED)
             prev_q, prev_a = await repo.get_previous_qa_for_session(session.id)
+            filter_ready, filter_result, credits_checked = False, None, False
             if prev_q and prev_a:
-                relation = await self.context_relation.evaluate(
-                    repo,
-                    current_question=gate_result.question_text,
-                    previous_question=prev_q.normalized_question or prev_q.raw_question,
-                    previous_answer=prev_a.response_text,
-                    session_id=session.id,
-                    question_id=question.id,
-                )
+                cached_candidate = None
+                if self.settings.parallel_classifiers_enabled:
+                    confirmed = (user.profile_facts if user else {}).get("confirmed", [])
+                    if not confirmed and self._cache_lookup_allowed(gate_result.question_text):
+                        cached_candidate = await repo.get_cached_answer(
+                            self._cache_key(gate_result.question_text, response_mode, level)
+                        )
+                if self.settings.parallel_classifiers_enabled and cached_candidate is None:
+                    # No reusable answer: reserve before spending on either classifier.
+                    if is_private:
+                        reserved = await self.credit_service.reserve(
+                            repo, user_id, request_id, response_mode
+                        )
+                        if reserved is None:
+                            await repo.before_external()
+                            await self._reply_text(bot, message, INSUFFICIENT_CREDITS)
+                            return
+                        reserved_credits, credits_checked = reserved, True
+                    await repo.before_external()
+                    relation, filter_result = await self._classify_parallel(
+                        repo,
+                        question=gate_result.question_text,
+                        previous_question=prev_q.normalized_question or prev_q.raw_question,
+                        previous_answer=prev_a.response_text,
+                        session_id=session.id,
+                        question_id=question.id,
+                    )
+                    filter_ready = True
+                else:
+                    relation = await self.context_relation.evaluate(
+                        repo,
+                        current_question=gate_result.question_text,
+                        previous_question=prev_q.normalized_question or prev_q.raw_question,
+                        previous_answer=prev_a.response_text,
+                        session_id=session.id,
+                        question_id=question.id,
+                    )
                 if not is_private and relation.relation != "related":
                     session = await self.session_service.create_new_session(repo, message)
                     question.session_id = session.id
@@ -302,6 +335,14 @@ class QuestionService:
             cache_allowed = (relation is None or relation.relation == "standalone") and not (
                 contextual or memory or summary or history or previous_answer
             )
+            if filter_ready and (
+                filter_result is None
+                or not filter_result.allowed
+                or filter_result.is_junk
+                or filter_result.is_prompt_injection
+                or filter_result.is_knowledge_exfiltration
+            ):
+                cache_allowed = False
             if await self._maybe_serve_cached_answer(
                 repo,
                 bot,
@@ -319,7 +360,7 @@ class QuestionService:
             ):
                 handed_to_delivery = self.settings.store_bot_responses
                 return
-            if is_private:
+            if is_private and not credits_checked:
                 reserved = await self.credit_service.reserve(
                     repo, user_id, request_id, response_mode
                 )
@@ -333,17 +374,22 @@ class QuestionService:
                 if contextual and relation.rewritten_question
                 else gate_result.question_text
             )
-            filter_result = await self.industry_filter.evaluate(
-                repo,
-                question=filter_question,
-                session_id=session.id,
-                question_id=question.id,
-                is_ambiguous_followup=bool(relation and relation.relation == "ambiguous"),
-            )
+            if not filter_ready:
+                filter_result = await self.industry_filter.evaluate(
+                    repo,
+                    question=filter_question,
+                    session_id=session.id,
+                    question_id=question.id,
+                    is_ambiguous_followup=bool(relation and relation.relation == "ambiguous"),
+                )
             if filter_result is None:
                 await self._fail_closed(bot, message, question.id, session.id, repo)
                 return
-            normalized = filter_result.normalized_question or gate_result.question_text
+            normalized = (
+                filter_question
+                if contextual and filter_ready
+                else filter_result.normalized_question or gate_result.question_text
+            )
             allowed = (
                 filter_result.allowed
                 and not filter_result.is_junk
@@ -452,6 +498,35 @@ class QuestionService:
                     await self.notifications.finish(bot, request_id)
             finally:
                 self.gate.release_concurrent(user_id)
+
+    async def _classify_parallel(
+        self, repo, *, question, previous_question, previous_answer, session_id, question_id
+    ):
+        from app.db.session import session_scope
+
+        async def call(agent, **kwargs):
+            # AsyncSession cannot be shared between concurrent tasks. Both child
+            # transactions carry the same durable owner fence and commit usage once.
+            async with session_scope() as db:
+                child = Repository(db)
+                child.processing_lease = repo.processing_lease
+                return await agent.evaluate(
+                    child, session_id=session_id, question_id=question_id, **kwargs
+                )
+
+        async with asyncio.TaskGroup() as tasks:
+            context = tasks.create_task(
+                call(
+                    self.context_relation,
+                    current_question=question,
+                    previous_question=previous_question,
+                    previous_answer=previous_answer,
+                )
+            )
+            filtered = tasks.create_task(
+                call(self.industry_filter, question=question, has_previous_food_context=True)
+            )
+        return context.result(), filtered.result()
 
     async def _persist_answer(
         self,

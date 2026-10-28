@@ -15,6 +15,8 @@ from app.main import create_app
 def webhook_client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
     monkeypatch.setenv("APP_ENV", "development")
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "secret")
+    # This fixture explicitly exercises the legacy synchronous mode without PostgreSQL.
+    monkeypatch.setenv("DURABLE_UPDATE_QUEUE_ENABLED", "false")
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
     clear_settings_cache()
     app = create_app()

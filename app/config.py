@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     timeweb_max_attempts: int = Field(default=2, ge=1, le=5)
     timeweb_deadline_seconds: float = Field(default=150, gt=0)
     timeweb_max_http_requests: int = Field(default=6, ge=1, le=20)
+    timeweb_preferred_transport: Literal["openai", "native"] = "openai"
 
     user_requests_per_minute: int = 6
     user_requests_per_hour: int = 60
@@ -79,7 +80,7 @@ class Settings(BaseSettings):
     answer_cache_enabled: bool = True
     answer_cache_min_question_len: int = 10
 
-    rich_messages_enabled: bool = True
+    rich_messages_enabled: bool = False
 
     private_access_enabled: bool = True
     access_contact_username: str = "pprostodenis"
@@ -92,15 +93,17 @@ class Settings(BaseSettings):
     private_context_turns: int = 6
     private_memory_max_chars: int = 6000
     knowledge_base_version: str = "1"
-    prompt_version: str = "5"
+    prompt_version: str = "6"
     timeweb_prompt_source: Literal["local", "panel"] = "local"
     timeweb_panel_prompt_set_version: str = ""
     answer_expansion_credits: int = Field(default=4, ge=1)
     recommendations_enabled: bool = True
     courses_url: str = "https://t.me/ferm2bot"
     shop_url: str = "https://t.me/AtlasMoldShopBot"
-    durable_update_queue_enabled: bool = False
+    durable_update_queue_enabled: bool = True
     update_queue_concurrency: int = Field(default=2, ge=1, le=8)
+    delivery_queue_concurrency: int = Field(default=2, ge=1, le=8)
+    parallel_classifiers_enabled: bool = True
     processing_lease_seconds: int = Field(default=300, ge=60)
     database_pool_size: int = Field(default=5, ge=2)
     database_max_overflow: int = Field(default=5, ge=0)
@@ -234,6 +237,12 @@ class Settings(BaseSettings):
             url.render_as_string(hide_password=False),
         )
         return self
+
+    @property
+    def use_durable_update_queue(self) -> bool:
+        # A configured bot must acknowledge Telegram before waiting for AI.
+        # Keep the no-database synchronous path only for isolated development/tests.
+        return self.durable_update_queue_enabled or bool(self.database_url)
 
     @property
     def is_production(self) -> bool:

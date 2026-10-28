@@ -26,6 +26,7 @@ SERVICE_COMMANDS = frozenset(
         "admin_block_session",
         "admin_unblock_session",
         "admin_cost_today",
+        "admin_latency",
         "admin_kill_switch_on",
         "admin_kill_switch_off",
     }

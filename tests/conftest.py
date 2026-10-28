@@ -32,6 +32,8 @@ def settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
     monkeypatch.setenv("TIMEWEB_AGENT_2_TOKEN", "t2")
     monkeypatch.setenv("TIMEWEB_AGENT_3_ID", "agent3")
     monkeypatch.setenv("TIMEWEB_AGENT_3_TOKEN", "t3")
+    # Legacy transport-specific fixtures explicitly exercise native-first fallback.
+    monkeypatch.setenv("TIMEWEB_PREFERRED_TRANSPORT", "native")
     clear_settings_cache()
     return Settings()
 

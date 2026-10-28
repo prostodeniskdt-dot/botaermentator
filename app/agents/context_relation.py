@@ -58,6 +58,7 @@ class ContextRelationAgent:
             if parsed is not None:
                 return parsed
             retry_started = datetime.now(UTC)
+            started = retry_started
             await repo.before_external()
             retry = await self.client.call_agent(
                 agent_id=self.settings.timeweb_agent_2_id,
@@ -134,6 +135,7 @@ class ContextRelationAgent:
             actual_cost_rub=getattr(call, "actual_cost_rub", None),
             estimated_cost_rub=self.settings.agent_2_estimated_cost_rub,
             transport=getattr(call, "transport", None),
+            model_name=getattr(call, "model_name", None),
             attempt_number=getattr(call, "attempt_number", 1),
             error_code=error_code,
         )

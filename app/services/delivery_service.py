@@ -7,7 +7,6 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramRet
 from aiogram.types import Chat, Message
 
 from app.bot.formatting.telegram_html import (
-    escape_html,
     format_response_html,
     split_html_message,
     utf16_length,
@@ -26,9 +25,10 @@ class DeliveryUnknownError(Exception):
 def delivery_plan(text, *, rich_enabled):
     # Long Markdown is rendered and split structurally as HTML before any send.
     # This also makes rich-method fallback independent of previously sent parts.
-    if rich_enabled and utf16_length(text) <= 3000:
+    html_parts = split_html_message(format_response_html(text))
+    if rich_enabled and utf16_length(text) <= 3000 and len(html_parts) == 1:
         return [(prep_rich_markdown(text), "rich")]
-    return [(part, "html") for part in split_html_message(format_response_html(text))]
+    return [(part, "html") for part in html_parts]
 
 
 class DeliveryService:
@@ -83,7 +83,7 @@ class DeliveryService:
                             sent = await self.questions._send_message(
                                 bot,
                                 source,
-                                escape_html(part.text),
+                                format_response_html(part.text),
                                 parse_mode=ParseMode.HTML,
                                 reply=part.part_index == 0,
                             )

@@ -58,6 +58,8 @@ class MainExpertAgent:
             mode_instruction = (
                 "Response mode: concise. Give the direct answer, required actions, and only "
                 "critical warnings. Do not add background the user already has."
+                " Aim for 60–100 Russian words when sufficient. Preserve necessary safety "
+                "controls and finish the answer; do not repeat it as a final summary."
             )
             max_output_tokens = self.settings.quick_max_output_tokens
 
@@ -219,6 +221,7 @@ class MainExpertAgent:
             estimated_cost_rub=estimated_cost or self.settings.agent_3_estimated_cost_rub,
             response_mode=response_mode,
             transport=getattr(call, "transport", None),
+            model_name=getattr(call, "model_name", None),
             attempt_number=getattr(call, "attempt_number", 1),
             error_code=error_code,
         )

@@ -28,6 +28,7 @@ class UpdateQueueWorker:
         heartbeat_seconds: int,
         delivery_handler,
         concurrency: int = 2,
+        delivery_concurrency: int = 2,
         maintenance_handler=None,
         enable_updates=True,
         delivery_failure_handler=None,
@@ -35,6 +36,7 @@ class UpdateQueueWorker:
         self.delivery_failure_handler = delivery_failure_handler
         self.enable_updates = enable_updates
         self.concurrency = concurrency
+        self.delivery_concurrency = delivery_concurrency
         self.maintenance_handler = maintenance_handler
         self.bot = bot
         self.dispatcher = dispatcher
@@ -46,8 +48,14 @@ class UpdateQueueWorker:
         self._stopping = asyncio.Event()
 
     async def run(self) -> None:
-        logger.info("update_queue_worker_started", concurrency=self.concurrency)
-        tasks = [asyncio.create_task(self._run_deliveries())]
+        logger.info(
+            "update_queue_worker_started",
+            concurrency=self.concurrency,
+            delivery_concurrency=self.delivery_concurrency,
+        )
+        tasks = [
+            asyncio.create_task(self._run_deliveries()) for _ in range(self.delivery_concurrency)
+        ]
         if self.enable_updates:
             tasks.extend(
                 asyncio.create_task(self._run_updates("question")) for _ in range(self.concurrency)

@@ -52,6 +52,7 @@ class TimewebCallResult:
     used_web_search: bool = False
     transport: str | None = None
     attempt_number: int = 1
+    model_name: str | None = None
 
 
 class TimewebClient:
@@ -62,7 +63,7 @@ class TimewebClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         # Store only endpoint metadata, never tokens, questions or responses.
-        self._transport_preferences: dict[tuple[str, bool], tuple[str, str, float]] = {}
+        self._transport_preferences: dict[tuple[str, bool, str], tuple[str, str, float]] = {}
         timeout = httpx.Timeout(
             connect=settings.timeweb_connect_timeout_seconds,
             read=settings.timeweb_read_timeout_seconds,
@@ -95,7 +96,7 @@ class TimewebClient:
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         last_error = None
         count = 0
-        key = (agent_id, max_output_tokens is not None)
+        key = (agent_id, max_output_tokens is not None, self.settings.timeweb_preferred_transport)
         variants = self._request_variants(agent_id, message, max_output_tokens)
         preferred = self._transport_preferences.get(key)
         if preferred and time.monotonic() < preferred[2]:
@@ -108,8 +109,22 @@ class TimewebClient:
                     raise last_error or TimewebClientError("HTTP request budget exhausted")
                 count += 1
                 try:
-                    with stage("agent_http", agent_id=agent_id, transport=mode, attempt=count):
+                    with stage(
+                        "agent_http",
+                        agent_id=agent_id,
+                        transport=mode,
+                        attempt=count,
+                        reasoning_none_requested=mode
+                        in {"chat_completions_no_reasoning", "responses"},
+                    ):
                         result = await self._post_once(url, headers, payload, time.perf_counter())
+                    if mode in {"native", "responses_plain"}:
+                        logger.info(
+                            "timeweb_panel_reasoning_default",
+                            agent_id=agent_id,
+                            transport=mode,
+                            model_name=result.model_name,
+                        )
                     self._transport_preferences[key] = (
                         mode,
                         url,
@@ -206,6 +221,14 @@ class TimewebClient:
                 },
             )
         )
+        if self.settings.timeweb_preferred_transport == "openai":
+            rank = {
+                "chat_completions_no_reasoning": 0,
+                "responses": 1,
+                "native": 2,
+                "responses_plain": 3,
+            }
+            variants.sort(key=lambda variant: rank[variant[0]])
         return variants
 
     def _native_urls(self, agent_id: str) -> list[str]:
@@ -282,6 +305,7 @@ class TimewebClient:
             output_tokens=usage.get("output_tokens") or usage.get("completion_tokens"),
             actual_cost_rub=usage.get("cost_rub") or data.get("cost_rub"),
             used_web_search=bool(data.get("web_search_used") or data.get("used_web_search")),
+            model_name=data["model"][:128] if isinstance(data.get("model"), str) else None,
         )
 
     async def _backoff(self, attempt: int) -> None:

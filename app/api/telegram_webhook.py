@@ -47,7 +47,7 @@ def create_webhook_router(settings: Settings | None = None) -> APIRouter:
             )
         logger.info("telegram_webhook_received", update_id=update_id)
 
-        if webhook_settings.durable_update_queue_enabled:
+        if webhook_settings.use_durable_update_queue:
             async with session_scope() as db:
                 queued = await Repository(db).enqueue_update_job(update_id, payload)
             logger.info(

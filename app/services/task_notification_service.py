@@ -12,18 +12,22 @@ from app.services.metrics import stage
 
 logger = get_logger(__name__)
 ACCEPTED = "Задачу получил, начинаю подготовку ответа."
+RECEIVED = "Сообщение получил, проверяю вопрос."
 
 
 class TaskNotificationService:
     _TELEGRAM_TIMEOUT_SECONDS = 5
 
-    async def start(self, repo, bot, message, request_id):
+    async def start(self, repo, bot, message, request_id, *, text=ACCEPTED):
+        existing = await repo.notice_for_request(request_id)
+        if existing is not None and existing.state == "active":
+            return
         await repo.before_external()
         try:
             with stage("task_notice_send", request_id=str(request_id)):
                 sent = await bot.send_message(
                     chat_id=message.chat.id,
-                    text=ACCEPTED,
+                    text=text,
                     message_thread_id=message.message_thread_id,
                 )
         except TelegramAPIError:
