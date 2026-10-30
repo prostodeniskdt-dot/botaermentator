@@ -36,7 +36,8 @@ settings are unchanged. Timeouts have not been shortened to turn long requests i
 - Two delivery workers serve different chats independently. PostgreSQL claims preserve order within
   one chat, including backoff and stale recovery. Service commands retain reserved worker capacity.
 - Quick requests a complete concise answer, normally 60–100 words when sufficient. Deep retains
-  its detailed scope. Required safety information is preserved; output limits stay 600/2200 tokens.
+  its detailed scope. Required safety information is preserved. Output defaults are now 600/5000
+  tokens; see DEEP_CONTINUATION.md for the later continuation change.
 
 ## API and configuration
 
@@ -59,7 +60,7 @@ Relevant Timeweb documentation:
 
 Defaults in `.env.example` include `PARALLEL_CLASSIFIERS_ENABLED=true`,
 `DELIVERY_QUEUE_CONCURRENCY=2`, `UPDATE_QUEUE_CONCURRENCY=2`, `RICH_MESSAGES_ENABLED=false` and
-`PROMPT_VERSION=6`. Existing explicit environment values override ordinary defaults; update them
+`PROMPT_VERSION=7`. Existing explicit environment values override ordinary defaults; update them
 when adopting the new configuration. Durable ingestion with a database is mandatory as described
 above. Account for all processes when sizing database and provider capacity. No schema change is
 required beyond the existing migrations.

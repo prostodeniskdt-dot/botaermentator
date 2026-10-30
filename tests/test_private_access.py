@@ -298,7 +298,7 @@ async def test_cached_private_answer_is_saved_to_user_history(settings) -> None:
     )
     repo = AsyncMock()
     session = MagicMock(id=uuid.uuid4(), summary=None)
-    repo.create_question.return_value = MagicMock(id=uuid.uuid4())
+    repo.create_question.return_value = MagicMock(id=uuid.uuid4(), generation_state={})
     cached = MagicMock(
         answer_text="Ферментация — управляемое изменение продукта.", category="fermentation"
     )

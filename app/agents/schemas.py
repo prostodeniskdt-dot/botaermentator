@@ -57,3 +57,6 @@ class TimewebAgentResponse(BaseModel):
     output_tokens: int | None = None
     actual_cost_rub: float | None = None
     used_web_search: bool = False
+    is_complete: bool = True
+    continuation_count: int = 0
+    incomplete_reason: str | None = None

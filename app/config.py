@@ -89,11 +89,12 @@ class Settings(BaseSettings):
     quick_mode_credits: int = 1
     deep_mode_credits: int = 5
     quick_max_output_tokens: int = Field(default=600, ge=128, le=16384)
-    deep_max_output_tokens: int = Field(default=2200, ge=128, le=32768)
+    deep_max_output_tokens: int = Field(default=5000, ge=128, le=32768)
+    deep_max_continuations: int = Field(default=2, ge=0, le=4)
     private_context_turns: int = 6
     private_memory_max_chars: int = 6000
     knowledge_base_version: str = "1"
-    prompt_version: str = "6"
+    prompt_version: str = "7"
     timeweb_prompt_source: Literal["local", "panel"] = "local"
     timeweb_panel_prompt_set_version: str = ""
     answer_expansion_credits: int = Field(default=4, ge=1)

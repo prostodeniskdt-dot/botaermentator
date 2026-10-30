@@ -1328,6 +1328,20 @@ class Repository:
         )
         return result.scalar_one_or_none()
 
+    async def get_generation_state(self, question_id):
+        from copy import deepcopy
+
+        question = await self.get_question(question_id)
+        return deepcopy(question.generation_state or {}) if question else {}
+
+    async def save_generation_state(self, question_id, state):
+        from copy import deepcopy
+
+        await self.ensure_processing_lease()
+        question = await self.get_question(question_id)
+        question.generation_state = deepcopy(state)
+        await self.session.flush()
+
     async def response_for_question(self, question_id):
         result = await self.session.execute(
             select(BotResponse)
@@ -1353,6 +1367,26 @@ class Repository:
     async def notice_for_request(self, request_id):
         return await self.session.get(TaskNotice, request_id)
 
+    def _resumable_expert_requests(self):
+        return (
+            select(UserQuestion.request_id)
+            .join(
+                TelegramUpdateJob,
+                or_(
+                    TelegramUpdateJob.telegram_update_id == UserQuestion.telegram_update_id,
+                    TelegramUpdateJob.payload["callback_query"]["data"].astext
+                    == "expand:"
+                    + UserQuestion.generation_state["delivery"]["expansion_source_id"].astext,
+                ),
+            )
+            .where(
+                UserQuestion.status.in_(["pending", "processing"]),
+                UserQuestion.filter_allowed.is_(True),
+                UserQuestion.generation_state["delivery"].astext.is_not(None),
+                TelegramUpdateJob.status.in_(["pending", "processing"]),
+            )
+        )
+
     async def notice_cleanup_candidates(self):
         live = select(UserProcessingLease.request_id).where(
             UserProcessingLease.expires_at > datetime.now(UTC)
@@ -1369,6 +1403,7 @@ class Repository:
                 TaskNotice.attempts < 5,
                 TaskNotice.request_id.not_in(live),
                 TaskNotice.request_id.not_in(pending_answers),
+                TaskNotice.request_id.not_in(self._resumable_expert_requests()),
             )
             .limit(100)
         )
@@ -1419,6 +1454,7 @@ class Repository:
             .where(
                 UserQuestion.status.in_(["pending", "processing"]),
                 UserQuestion.request_id.not_in(live),
+                UserQuestion.request_id.not_in(self._resumable_expert_requests()),
             )
             .with_for_update(skip_locked=True)
             .limit(100)
@@ -1440,6 +1476,7 @@ class Repository:
                 )
             recovered.append((session.chat_id, question.request_id))
             question.status = "failed"
+            question.generation_state = {}
             await self.session.execute(
                 update(AnswerExpansion)
                 .where(

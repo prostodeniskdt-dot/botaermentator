@@ -1,11 +1,11 @@
 """An expansion is a single durable operation tied to its original answer."""
 
+from app.agents.expert_continuation import incomplete_response
 from app.db.repositories import Repository
 from app.db.session import session_scope
 from app.domain.enums import AccessStatus, ResponseMode
 from app.domain.messages import AGENT_ERROR, INSUFFICIENT_CREDITS
 from app.services.processing_lease import processing_lease
-from app.services.recommendations import recommend
 
 
 class AnswerExpansionService:
@@ -44,6 +44,24 @@ class AnswerExpansionService:
                 if user.is_blocked or user.access_status != AccessStatus.ACTIVE:
                     return "Доступ не разрешён."
                 offer = await repo.expansion_for_response(source_id, lock=True)
+                if offer.status == "processing" and offer.question_id:
+                    question = await repo.get_question(offer.question_id)
+                    if question and question.generation_state.get("delivery"):
+                        from aiogram.types import Chat, Message
+
+                        message = Message(
+                            message_id=source.telegram_message_id or 0,
+                            date=1,
+                            chat=Chat(id=user_id, type="private"),
+                            text="",
+                        )
+                        ok = await self.questions._resume_expert_answer(
+                            repo, bot, message, question
+                        )
+                        if not ok:
+                            offer.status = "failed"
+                            await repo.before_external()
+                        return "Готовлю доставку расширенного ответа." if ok else AGENT_ERROR
                 if offer.status != "offered":
                     return "Расширение уже подготовлено или недоступно для повторной генерации."
                 await repo.session.refresh(session)
@@ -85,35 +103,39 @@ class AnswerExpansionService:
                 offer.question_id = question.id
                 offer.status = "processing"
                 committed = False
+                interrupted = False
                 try:
                     await self.questions.notifications.start(repo, bot, message, request_id)
                     snapshot = source.context_snapshot or {}
+                    expert_request = {
+                        "question": original.raw_question,
+                        "expansion_of": source.response_text,
+                        "response_mode": str(ResponseMode.DEEP),
+                        "knowledge_level": snapshot.get("knowledge_level", "default"),
+                        "user_memory": snapshot.get("user_memory"),
+                        "conversation_summary": snapshot.get("summary"),
+                        "conversation_history": snapshot.get("history"),
+                    }
+                    await self.questions._checkpoint_expert_request(
+                        repo,
+                        question,
+                        expert_request,
+                        snapshot=snapshot,
+                        reserved_credits=reserved,
+                        user_id=user_id,
+                        expansion_source_id=source_id,
+                    )
                     result = await self.questions.main_expert.answer(
                         repo,
-                        question=original.raw_question,
-                        expansion_of=source.response_text,
                         session_id=session.id,
                         question_id=question.id,
                         request_id=request_id,
-                        response_mode=ResponseMode.DEEP,
-                        knowledge_level=snapshot.get("knowledge_level", "default"),
-                        user_memory=snapshot.get("user_memory"),
-                        conversation_summary=snapshot.get("summary"),
-                        conversation_history=snapshot.get("history"),
+                        **expert_request,
                     )
                     if result is None or not result.text.strip():
                         return AGENT_ERROR
-                    truncated = result.finish_reason in {
-                        "length",
-                        "max_tokens",
-                        "max_output_tokens",
-                        "incomplete",
-                    }
-                    text = result.text
-                    if truncated:
-                        text += "\n\nОтвет остановлен по лимиту генерации и может быть неполным."
-                    else:
-                        text = recommend(original.raw_question, text, self.settings)
+                    truncated = incomplete_response(result)
+                    text = self.questions._expert_response_text(result, original.raw_question)
                     await self.questions._persist_answer(
                         repo,
                         bot,
@@ -131,8 +153,11 @@ class AnswerExpansionService:
                     await repo.before_external()
                     committed = True
                     return "Готовлю доставку расширенного ответа."
+                except BaseException:
+                    interrupted = bool(question.generation_state.get("delivery"))
+                    raise
                 finally:
-                    if not committed:
+                    if not committed and not interrupted:
                         await repo.ensure_processing_lease()
                         if reserved:
                             await self.questions.credit_service.release(
@@ -140,5 +165,6 @@ class AnswerExpansionService:
                             )
                         offer.status = "failed"
                         question.status = "failed"
+                        question.generation_state = {}
                         await repo.before_external()
                         await self.questions.notifications.finish(bot, request_id)

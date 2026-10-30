@@ -293,7 +293,8 @@ class TimewebClient:
                 status_code=response.status_code,
                 error_code="empty_response",
             )
-        usage = data.get("usage") or {}
+        usage = data.get("usage")
+        usage = usage if isinstance(usage, dict) else {}
         return TimewebCallResult(
             message=message_text,
             response_id=str(data.get("id") or data.get("response_id") or "") or None,
@@ -301,9 +302,9 @@ class TimewebClient:
             http_status=response.status_code,
             latency_ms=latency_ms,
             raw=data,
-            input_tokens=usage.get("input_tokens") or usage.get("prompt_tokens"),
-            output_tokens=usage.get("output_tokens") or usage.get("completion_tokens"),
-            actual_cost_rub=usage.get("cost_rub") or data.get("cost_rub"),
+            input_tokens=usage.get("input_tokens", usage.get("prompt_tokens")),
+            output_tokens=usage.get("output_tokens", usage.get("completion_tokens")),
+            actual_cost_rub=usage.get("cost_rub", data.get("cost_rub")),
             used_web_search=bool(data.get("web_search_used") or data.get("used_web_search")),
             model_name=data["model"][:128] if isinstance(data.get("model"), str) else None,
         )
@@ -361,8 +362,25 @@ def _extract_message(data: dict[str, Any]) -> str:
 def _finish_reason(data: dict) -> str | None:
     choices = data.get("choices") or []
     reason = data.get("finish_reason")
-    if not reason and choices and isinstance(choices[0], dict):
+    if not reason and isinstance(choices, list) and choices and isinstance(choices[0], dict):
         reason = choices[0].get("finish_reason")
     if data.get("status") == "incomplete":
-        reason = (data.get("incomplete_details") or {}).get("reason") or "incomplete"
-    return reason or data.get("status")
+        details = data.get("incomplete_details")
+        reason = details.get("reason") if isinstance(details, dict) else None
+        reason = reason or "incomplete"
+    reason = reason or data.get("status")
+    if reason is None:
+        return None
+    known = {
+        "stop",
+        "completed",
+        "length",
+        "max_tokens",
+        "max_completion_tokens",
+        "max_output_tokens",
+        "incomplete",
+        "content_filter",
+        "error",
+        "failed",
+    }
+    return reason if isinstance(reason, str) and reason in known else "incomplete"

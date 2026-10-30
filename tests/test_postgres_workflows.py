@@ -13,11 +13,14 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import app.db.session as sessions
+from app.agents.main_expert import MainExpertAgent
 from app.agents.schemas import ContextRelationResult, IndustryFilterResult, TimewebAgentResponse
+from app.agents.timeweb_client import TimewebTimeoutError
 from app.bot.factory import build_services
 from app.config import Settings
 from app.db.base import Base
 from app.db.models.entities import (
+    AIUsageEvent,
     AnswerExpansion,
     BotResponse,
     CreditAccount,
@@ -31,6 +34,39 @@ from app.db.models.entities import (
 from app.db.repositories import Repository
 from app.services.answer_expansion_service import AnswerExpansionService
 from app.services.update_queue import UpdateQueueWorker
+from tests.test_expert_continuation import fragment
+
+
+async def expert_events(db):
+    return list(
+        (
+            await db.execute(select(AIUsageEvent).where(AIUsageEvent.agent_type == "main_expert"))
+        ).scalars()
+    )
+
+
+async def test_failed_error_notice_does_not_keep_credits_or_repeat_unknown_send(
+    db_factory, service
+):
+    await add_user(db_factory)
+    client = AsyncMock()
+    client.call_agent.side_effect = TimewebTimeoutError("unknown")
+    service.main_expert = MainExpertAgent(service.settings, client)
+    bot = bot_mock()
+    bot.send_message.side_effect = [
+        SimpleNamespace(message_id=100),
+        TelegramNetworkError(method=AsyncMock(), message="synthetic unknown send outcome"),
+    ]
+    with pytest.raises(TelegramNetworkError):
+        await ask(db_factory, service, bot, mode="deep")
+    await ask(db_factory, service, bot, mode="deep")
+    assert bot.send_message.await_count == 2  # receipt and one attempted error notice.
+    assert client.call_agent.await_count == 1
+    async with db_factory() as db:
+        account = (await db.execute(select(CreditAccount))).scalar_one()
+        assert (account.balance, account.reserved) == (50, 0)
+        assert (await db.execute(select(UserQuestion))).scalar_one().status == "failed"
+
 
 pytestmark = pytest.mark.skipif(
     not os.getenv("TEST_DATABASE_URL"), reason="Requires isolated TEST_DATABASE_URL"
@@ -1124,3 +1160,274 @@ async def test_possible_cache_hit_preserves_credit_free_path_with_zero_balance(d
     async with db_factory() as db:
         account = await Repository(db).get_or_create_credit_account(7)
         assert account.balance == 0 and account.reserved == 0
+
+
+async def test_deep_continuation_costs_five_once_and_delivery_retry_skips_sent_parts(
+    db_factory, service
+):
+    await add_user(db_factory)
+    client = AsyncMock()
+    start = "\n\n".join(f"**Этап {n}**\nКонтролируйте pH и температуру." for n in range(160))
+    client.call_agent.side_effect = [
+        fragment(start, "length", 5000),
+        fragment("Не пробуйте сомнительный продукт.\n\nОтвет завершён."),
+    ]
+    service.main_expert = MainExpertAgent(service.settings, client)
+    bot = bot_mock()
+    await ask(db_factory, service, bot, mode="deep")
+    await ask(db_factory, service, bot, mode="deep")
+    assert client.call_agent.await_count == 2
+    async with db_factory() as db:
+        account = (await db.execute(select(CreditAccount))).scalar_one()
+        assert (account.balance, account.reserved) == (45, 0)
+        charges = list(
+            (
+                await db.execute(
+                    select(CreditTransaction).where(CreditTransaction.transaction_type == "charge")
+                )
+            ).scalars()
+        )
+        assert [c.amount for c in charges] == [-5]
+        assert len(await expert_events(db)) == 2
+        question = (await db.execute(select(UserQuestion))).scalar_one()
+        assert question.status == "answered"
+        assert question.generation_state == {}
+        response = (await db.execute(select(BotResponse))).scalar_one()
+        assert "Не пробуйте сомнительный продукт." in response.response_text
+        assert "Ответ завершён." in response.response_text
+    job = await claim_delivery(db_factory)
+    bot.send_message.side_effect = [
+        SimpleNamespace(message_id=200),
+        TelegramBadRequest(method=AsyncMock(), message="synthetic reject"),
+    ]
+    with pytest.raises(TelegramBadRequest):
+        await service.deliver_job(bot, job)
+    async with db_factory.begin() as db:
+        await Repository(db).fail_delivery_job(
+            job.id, job.lease_id, error="test", retry=True, retry_delay_seconds=0
+        )
+    bot.send_message.reset_mock()
+    bot.send_message.side_effect = None
+    bot.send_message.return_value = SimpleNamespace(message_id=201)
+    await finish_delivery(db_factory, service, bot, await claim_delivery(db_factory))
+    async with db_factory() as db:
+        parts = await Repository(db).delivery_parts(job.id)
+        assert len(parts) > 1
+        assert parts[0].telegram_message_id == 200
+        assert bot.send_message.await_count == len(parts) - 1
+
+
+@pytest.mark.parametrize("with_partial", [True, False])
+async def test_deep_timeweb_failure_is_honest_and_does_not_double_charge(
+    db_factory, service, with_partial
+):
+    await add_user(db_factory)
+    client = AsyncMock()
+    client.call_agent.side_effect = (
+        [fragment("Не пробуйте сомнительный продукт.", "length")] if with_partial else []
+    ) + [TimewebTimeoutError("unknown")]
+    service.main_expert = MainExpertAgent(service.settings, client)
+    bot = bot_mock()
+    await ask(db_factory, service, bot, mode="deep")
+    await ask(db_factory, service, bot, mode="deep")
+    async with db_factory() as db:
+        question = (await db.execute(select(UserQuestion))).scalar_one()
+        assert question.status == ("truncated" if with_partial else "failed")
+        account = (await db.execute(select(CreditAccount))).scalar_one()
+        assert (account.balance, account.reserved) == (45 if with_partial else 50, 0)
+        events = await expert_events(db)
+        assert len(events) == 1 + int(with_partial)
+        assert not events[-1].success
+        response = (await db.execute(select(BotResponse))).scalar_one_or_none()
+        if with_partial:
+            assert "Ответ неполный" in response.response_text
+            assert "Не пробуйте сомнительный продукт." in response.response_text
+        else:
+            assert response is None
+            from app.domain.messages import AGENT_ERROR
+
+            assert any(c.kwargs.get("text") == AGENT_ERROR for c in bot.send_message.call_args_list)
+
+
+async def test_deep_checkpoint_survives_cancellation_cleanup_and_retry(
+    db_factory, service, monkeypatch
+):
+    await add_user(db_factory)
+    bot = bot_mock()
+    client = AsyncMock()
+    client.call_agent.side_effect = [
+        fragment("Партия: 2% соли, 20 °C.", "length"),
+        fragment("Контроль: измеряйте pH.\n\nНе пробуйте сомнительный продукт."),
+    ]
+    service.main_expert = MainExpertAgent(service.settings, client)
+    # A durable queued update remains reclaimable after process restart.
+    async with db_factory.begin() as db:
+        await Repository(db).enqueue_update_job(
+            1, {"update_id": 1, "message": private_message().model_dump(mode="json")}
+        )
+    original = Repository.save_generation_state
+    interrupted = False
+
+    async def save_and_interrupt(repo, question_id, state):
+        nonlocal interrupted
+        await original(repo, question_id, state)
+        progress = state.get("progress", {})
+        if not interrupted and progress.get("fragments") and not progress["in_flight"]:
+            interrupted = True
+            await repo.before_external()
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(Repository, "save_generation_state", save_and_interrupt)
+    with pytest.raises(asyncio.CancelledError):
+        await ask(db_factory, service, bot, mode="deep")
+    async with db_factory() as db:
+        account = (await db.execute(select(CreditAccount))).scalar_one()
+        assert (account.balance, account.reserved) == (50, 5)
+        question = (await db.execute(select(UserQuestion))).scalar_one()
+        assert question.generation_state["progress"]["fragments"]
+    await service.notifications.cleanup(bot)
+    async with db_factory() as db:
+        assert (await db.execute(select(UserQuestion))).scalar_one().status == "processing"
+        assert (await db.execute(select(TaskNotice))).scalar_one().state == "active"
+    # New service instance, existing PostgreSQL state, same original update.
+    service.main_expert = MainExpertAgent(service.settings, client)
+    await ask(db_factory, service, bot, mode="deep")
+    await ask(db_factory, service, bot, mode="deep")
+    assert client.call_agent.await_count == 2
+    async with db_factory() as db:
+        account = (await db.execute(select(CreditAccount))).scalar_one()
+        assert (account.balance, account.reserved) == (45, 0)
+        assert (await db.execute(select(UserQuestion))).scalar_one().status == "answered"
+        assert len(list((await db.execute(select(BotResponse))).scalars())) == 1
+        assert len(await expert_events(db)) == 2
+
+
+async def test_crash_during_continuation_delivers_saved_partial_without_repeating_call(
+    db_factory, service
+):
+    await add_user(db_factory)
+    client = AsyncMock()
+    client.call_agent.side_effect = [
+        fragment("Не пробуйте сомнительный продукт.", "length"),
+        asyncio.CancelledError(),
+    ]
+    service.main_expert = MainExpertAgent(service.settings, client)
+    bot = bot_mock()
+    with pytest.raises(asyncio.CancelledError):
+        await ask(db_factory, service, bot, mode="deep")
+    service.main_expert = MainExpertAgent(service.settings, client)
+    await ask(db_factory, service, bot, mode="deep")
+    await ask(db_factory, service, bot, mode="deep")
+    assert client.call_agent.await_count == 2
+    async with db_factory() as db:
+        account = (await db.execute(select(CreditAccount))).scalar_one()
+        assert (account.balance, account.reserved) == (45, 0)
+        question = (await db.execute(select(UserQuestion))).scalar_one()
+        assert question.status == "truncated"
+        response = (await db.execute(select(BotResponse))).scalar_one()
+        assert "Ответ неполный" in response.response_text
+        assert len(await expert_events(db)) == 2
+
+
+async def test_expansion_continues_automatically_without_charging_technical_calls(
+    db_factory, service
+):
+    await add_user(db_factory)
+    bot = bot_mock()
+    await ask(db_factory, service, bot)
+    await finish_delivery(db_factory, service, bot, await claim_delivery(db_factory))
+    async with db_factory() as db:
+        source = (await db.execute(select(BotResponse))).scalar_one()
+    client = AsyncMock()
+    client.call_agent.side_effect = [
+        fragment("Механизм и контроль процесса.", "length"),
+        fragment("Хранение и диагностика."),
+    ]
+    service.main_expert = MainExpertAgent(service.settings, client)
+    expansion = AnswerExpansionService(service)
+    assert "Готовлю" in await expansion.expand(bot, source.id, 7, 7)
+    assert "уже" in await expansion.expand(bot, source.id, 7, 7)
+    async with db_factory() as db:
+        account = (await db.execute(select(CreditAccount))).scalar_one()
+        assert (account.balance, account.reserved) == (45, 0)  # Quick + one expansion.
+        offer = await Repository(db).expansion_for_response(source.id)
+        assert offer.status == "generated"
+        assert len(await expert_events(db)) == 2
+    assert client.call_agent.await_count == 2
+
+
+async def test_finalization_rollback_reuses_complete_result_and_charges_only_once(
+    db_factory, service, monkeypatch
+):
+    await add_user(db_factory)
+    client = AsyncMock()
+    client.call_agent.return_value = fragment("Полный ответ. Не пробуйте сомнительный продукт.")
+    service.main_expert = MainExpertAgent(service.settings, client)
+    bot = bot_mock()
+    original = service._persist_answer
+    failed = False
+
+    async def rollback_once(repo, *args, **kwargs):
+        nonlocal failed
+        await original(repo, *args, **kwargs)
+        if not failed:
+            failed = True
+            await repo.session.rollback()
+            raise RuntimeError("Synthetic failure before atomic finalization commit")
+
+    monkeypatch.setattr(service, "_persist_answer", rollback_once)
+    with pytest.raises(RuntimeError):
+        await ask(db_factory, service, bot, mode="deep")
+    async with db_factory() as db:
+        assert (await db.execute(select(BotResponse))).scalar_one_or_none() is None
+        account = (await db.execute(select(CreditAccount))).scalar_one()
+        assert (account.balance, account.reserved) == (50, 5)
+    await ask(db_factory, service, bot, mode="deep")
+    await ask(db_factory, service, bot, mode="deep")
+    assert client.call_agent.await_count == 1
+    async with db_factory() as db:
+        account = (await db.execute(select(CreditAccount))).scalar_one()
+        assert (account.balance, account.reserved) == (45, 0)
+        assert len(list((await db.execute(select(BotResponse))).scalars())) == 1
+        assert len(await expert_events(db)) == 1
+
+
+async def test_expansion_restart_resumes_saved_fragment_at_original_price(
+    db_factory, service, monkeypatch
+):
+    await add_user(db_factory)
+    bot = bot_mock()
+    await ask(db_factory, service, bot)
+    await finish_delivery(db_factory, service, bot, await claim_delivery(db_factory))
+    async with db_factory() as db:
+        source = (await db.execute(select(BotResponse))).scalar_one()
+    client = AsyncMock()
+    client.call_agent.side_effect = [
+        fragment("Механизм процесса.", "length"),
+        fragment("Контроль, риски и хранение."),
+    ]
+    service.main_expert = MainExpertAgent(service.settings, client)
+    original = Repository.save_generation_state
+    interrupted = False
+
+    async def save_and_interrupt(repo, question_id, state):
+        nonlocal interrupted
+        await original(repo, question_id, state)
+        progress = state.get("progress", {})
+        if not interrupted and progress.get("fragments") and not progress["in_flight"]:
+            interrupted = True
+            await repo.before_external()
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(Repository, "save_generation_state", save_and_interrupt)
+    expansion = AnswerExpansionService(service)
+    with pytest.raises(asyncio.CancelledError):
+        await expansion.expand(bot, source.id, 7, 7)
+    assert "Готовлю" in await expansion.expand(bot, source.id, 7, 7)
+    assert "уже" in await expansion.expand(bot, source.id, 7, 7)
+    assert client.call_agent.await_count == 2
+    async with db_factory() as db:
+        account = (await db.execute(select(CreditAccount))).scalar_one()
+        assert (account.balance, account.reserved) == (45, 0)
+        offer = await Repository(db).expansion_for_response(source.id)
+        assert offer.status == "generated"

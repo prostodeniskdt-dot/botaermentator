@@ -149,8 +149,10 @@ before processing, including when an old environment still sets DURABLE_UPDATE_Q
 The synchronous path is retained only for development without a database.
 
 Verify all Timeweb transports, actual KB attachment and response finish reasons on a test agent.
-Output defaults stay 600/2200 until larger limits are verified with the configured model. Do not
-claim a speedup from mock-test timings. Never blindly requeue a delivery with an unknown send outcome.
+Output defaults are 600/5000 for Quick/Deep, with up to two technical Deep continuations. Existing
+explicit environment settings must be updated to adopt these defaults. See DEEP_CONTINUATION.md
+for migration 008 and the limits of provider verification. Do not claim a speedup from mock-test
+timings. Never blindly requeue a delivery with an unknown send outcome.
 
 See RESPONSE_SPEED_AND_LAYOUT.md for the current transport defaults, parallel classifiers, early
 receipt, formatting fixes and the `/admin_latency` diagnostic command.

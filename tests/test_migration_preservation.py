@@ -164,6 +164,9 @@ async def test_upgrade_preserves_existing_dialogue_profile_credits_and_queue():
             assert (
                 await conn.execute(text("SELECT context_snapshot FROM bot_responses"))
             ).scalar_one() == {}
+            assert (
+                await conn.execute(text("SELECT generation_state FROM user_questions"))
+            ).scalar_one() == {}
         await migrate("downgrade", "005_unlimited_access")
         assert await snapshot() == before
         await migrate("upgrade", "head")

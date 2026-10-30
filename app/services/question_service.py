@@ -16,6 +16,7 @@ from aiogram.types import (
 from structlog.contextvars import bound_contextvars
 
 from app.agents.context_relation import ContextRelationAgent
+from app.agents.expert_continuation import TOKEN_LIMIT_REASONS, incomplete_response
 from app.agents.industry_filter import IndustryFilterAgent
 from app.agents.main_expert import MainExpertAgent
 from app.agents.prompt_set import PROMPT_SET_VERSION, prompt_cache_version
@@ -24,7 +25,7 @@ from app.bot.keyboards import private_menu_keyboard
 from app.bot.mention import AddressKind
 from app.config import Settings
 from app.db.repositories import Repository
-from app.domain.enums import QuestionStatus, ResponseMode
+from app.domain.enums import AccessStatus, QuestionStatus, ResponseMode
 from app.domain.messages import (
     AGENT_ERROR,
     CONCURRENT_REQUEST,
@@ -159,6 +160,15 @@ class QuestionService:
                 await repo.session.rollback()
                 await repo.ensure_processing_lease()
                 question = await repo.question_by_request(request_id)
+                if question is not None and question.generation_state.get("delivery"):
+                    # Durable expert work can be resumed by the queued update. Do not
+                    # release its reservation or send another Telegram error here.
+                    raise
+                if question is not None and question.status not in {"pending", "processing"}:
+                    # The outcome is already durable. An unknown Telegram error-notice
+                    # outcome must not cause another send or leave credits reserved.
+                    await self.notifications.finish(bot, request_id)
+                    raise
                 if question is not None and question.status in {"pending", "processing"}:
                     await self._recover_interrupted(repo, question, message.from_user.id)
                 await repo.before_external()
@@ -184,6 +194,7 @@ class QuestionService:
                 repo, user_id, question.request_id, reservation.amount
             )
         question.status = "failed"
+        question.generation_state = {}
 
     async def _process_message(
         self,
@@ -218,6 +229,9 @@ class QuestionService:
         if gate_result.outcome == GateOutcome.DUPLICATE_UPDATE:
             interrupted = await repo.question_by_request(request_id)
             if interrupted is not None and interrupted.status in {"pending", "processing"}:
+                if interrupted.generation_state.get("delivery"):
+                    await self._resume_expert_answer(repo, bot, message, interrupted)
+                    return
                 await self._recover_interrupted(repo, interrupted, message.from_user.id)
                 await repo.before_external()
                 await self._reply_text(bot, message, AGENT_ERROR)
@@ -232,6 +246,7 @@ class QuestionService:
         reserved_credits = 0
         credits_committed = False
         handed_to_delivery = False
+        generation_started = False
         try:
             user = await repo.get_user_by_telegram_id(user_id)
             level = knowledge_level(user.profile_facts if user else {})
@@ -417,35 +432,6 @@ class QuestionService:
                 return
             question.context_relation = str(relation.relation) if relation else "standalone"
             await self.notifications.start(repo, bot, message, request_id)
-            result = await self.main_expert.answer(
-                repo,
-                question=filter_question if contextual else normalized,
-                session_id=session.id,
-                question_id=question.id,
-                previous_question=previous_question,
-                previous_answer=previous_answer,
-                conversation_history=history,
-                response_mode=response_mode,
-                request_id=request_id,
-                user_memory=memory,
-                conversation_summary=summary,
-                knowledge_level=level,
-                context_relation=relation.relation if relation else "standalone",
-            )
-            if result is None or not result.text.strip():
-                await self._fail_closed(bot, message, question.id, session.id, repo)
-                return
-            truncated = result.finish_reason in {
-                "length",
-                "max_tokens",
-                "max_output_tokens",
-                "incomplete",
-            }
-            text = result.text
-            if truncated:
-                text += "\n\nОтвет остановлен по лимиту генерации и может быть неполным."
-            else:
-                text = recommend(gate_result.question_text, text, self.settings)
             topic_root = await repo.current_topic_root(session.id) if contextual else question.id
             snapshot = {
                 "knowledge_level": str(level),
@@ -454,13 +440,45 @@ class QuestionService:
                 "user_memory": memory,
                 "topic_root_question_id": str(topic_root) if topic_root else None,
             }
+            expert_request = {
+                "question": filter_question if contextual else normalized,
+                "previous_question": previous_question,
+                "previous_answer": previous_answer,
+                "conversation_history": history,
+                "response_mode": str(response_mode),
+                "user_memory": memory,
+                "conversation_summary": summary,
+                "knowledge_level": str(level),
+                "context_relation": str(relation.relation) if relation else "standalone",
+            }
+            await self._checkpoint_expert_request(
+                repo,
+                question,
+                expert_request,
+                snapshot=snapshot,
+                reserved_credits=reserved_credits,
+                user_id=user_id,
+            )
+            generation_started = True
+            result = await self.main_expert.answer(
+                repo,
+                session_id=session.id,
+                question_id=question.id,
+                request_id=request_id,
+                **expert_request,
+            )
+            if result is None or not result.text.strip():
+                generation_started = False
+                await self._fail_closed(bot, message, question.id, session.id, repo)
+                return
+            truncated = incomplete_response(result)
             await self._persist_answer(
                 repo,
                 bot,
                 message,
                 session,
                 question,
-                text=text,
+                text=self._expert_response_text(result, gate_result.question_text),
                 response_id=result.response_id,
                 snapshot=snapshot,
                 reserved_credits=reserved_credits,
@@ -489,6 +507,13 @@ class QuestionService:
             if relation:
                 await repo.update_question_context_relation(question.id, relation.relation)
             await repo.before_external()
+        except BaseException:
+            if generation_started:
+                # Preserve the durable reservation and receipt for recovery, including
+                # cancellation during graceful shutdown or loss of a worker lease.
+                reserved_credits = 0
+                handed_to_delivery = True
+            raise
         finally:
             try:
                 if reserved_credits and not credits_committed:
@@ -498,6 +523,112 @@ class QuestionService:
                     await self.notifications.finish(bot, request_id)
             finally:
                 self.gate.release_concurrent(user_id)
+
+    async def _checkpoint_expert_request(
+        self,
+        repo,
+        question,
+        expert_request,
+        *,
+        snapshot,
+        reserved_credits,
+        user_id,
+        expansion_source_id=None,
+    ):
+        await repo.save_generation_state(
+            question.id,
+            {
+                "expert_request": expert_request,
+                "delivery": {
+                    "snapshot": snapshot,
+                    "reserved_credits": reserved_credits,
+                    "user_id": user_id,
+                    "expansion_source_id": str(expansion_source_id)
+                    if expansion_source_id
+                    else None,
+                },
+            },
+        )
+        await repo.before_external()
+
+    def _expert_response_text(self, result, question):
+        if not incomplete_response(result):
+            return recommend(question, result.text, self.settings)
+        reason = result.incomplete_reason
+        if reason in {"provider_error", "outcome_unknown", "agent_changed"}:
+            notice = "Ответ неполный: продолжение не удалось получить или подтвердить."
+        elif reason == "budget_limit":
+            notice = "Ответ неполный: достигнут лимит обработки запросов сервиса."
+        elif reason == "continuation_limit" or (
+            reason is None and result.finish_reason in TOKEN_LIMIT_REASONS
+        ):
+            notice = (
+                "Ответ неполный: достигнут лимит генерации и автоматических продолжений."
+                if result.continuation_count
+                else "Ответ неполный: достигнут лимит генерации."
+            )
+        else:
+            notice = "Ответ неполный: сервис не подтвердил завершение генерации."
+        return (
+            result.text
+            + "\n\n"
+            + notice
+            + " Не считайте этот текст законченной технологической инструкцией."
+        )
+
+    async def _resume_expert_answer(self, repo, bot, message, question):
+        state = question.generation_state
+        delivery = state["delivery"]
+        user_id = delivery["user_id"]
+        user = await repo.get_user_by_telegram_id(user_id)
+        session = await repo.get_session(question.session_id)
+        if (
+            user is None
+            or user.is_blocked
+            or session is None
+            or session.status in {"paused", "blocked"}
+            or session.closed_at is not None
+            or (session.is_private and user.access_status != AccessStatus.ACTIVE)
+        ):
+            await self._recover_interrupted(repo, question, user_id)
+            question.generation_state = {}
+            await repo.before_external()
+            await self.notifications.finish(bot, question.request_id)
+            return False
+        result = await self.main_expert.answer(
+            repo,
+            session_id=question.session_id,
+            question_id=question.id,
+            request_id=question.request_id,
+            **state["expert_request"],
+        )
+        if result is None or not result.text.strip():
+            await self._recover_interrupted(repo, question, user_id)
+            question.generation_state = {}
+            await repo.before_external()
+            await self._reply_text(bot, message, AGENT_ERROR)
+            await self.notifications.finish(bot, question.request_id)
+            return False
+        await self._persist_answer(
+            repo,
+            bot,
+            message,
+            session,
+            question,
+            text=self._expert_response_text(result, question.raw_question),
+            response_id=result.response_id,
+            snapshot=delivery["snapshot"],
+            reserved_credits=delivery["reserved_credits"],
+            user_id=user_id,
+            response_status="truncated" if incomplete_response(result) else "answered",
+        )
+        if delivery.get("expansion_source_id"):
+            offer = await repo.expansion_for_response(uuid.UUID(delivery["expansion_source_id"]))
+            offer.status = "generated"
+        await repo.before_external()
+        if not self.settings.store_bot_responses:
+            await self.notifications.finish(bot, question.request_id)
+        return True
 
     async def _classify_parallel(
         self, repo, *, question, previous_question, previous_answer, session_id, question_id
@@ -578,6 +709,19 @@ class QuestionService:
             await self.credit_service.commit(repo, user_id, question.request_id, reserved_credits)
             await repo.set_question_credits_charged(question.id, reserved_credits)
         question.status = response_status
+        progress = (question.generation_state or {}).get("progress", {})
+        logger.info(
+            "expert_answer_persisted",
+            question_id=str(question.id),
+            response_mode=str(question.response_mode),
+            completed=response_status == "answered",
+            continuation_count=max(0, progress.get("attempts", 1) - 1),
+            telegram_parts=len(
+                delivery_plan(text, rich_enabled=self.settings.rich_messages_enabled)
+            ),
+        )
+        # Keep private prompts/drafts only until atomic finalization has succeeded.
+        question.generation_state = {}
         if summary_after is not None and question.context_relation != "expansion":
             await repo.update_session_summary(session.id, summary_after)
 
@@ -960,6 +1104,7 @@ class QuestionService:
             status=QuestionStatus.FAILED,
         )
         await self.blocking_service.add_junk_score(repo, session_id, reason="agent_error", delta=0)
+        await repo.save_generation_state(question_id, {})
         await repo.before_external()
         await self._reply_text(bot, message, AGENT_ERROR)
 

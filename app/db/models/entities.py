@@ -91,6 +91,7 @@ class UserQuestion(Base):
     response_mode: Mapped[str] = mapped_column(String(16), default="quick")
     credits_charged: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(32), default="pending")
+    generation_state: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     session: Mapped[ChatSession] = relationship(back_populates="questions")

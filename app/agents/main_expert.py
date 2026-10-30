@@ -5,6 +5,12 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
+from app.agents.expert_continuation import (
+    INCOMPLETE_REASONS,
+    TOKEN_LIMIT_REASONS,
+    continuation_message,
+    join_fragment,
+)
 from app.agents.prompt_set import approved_path, load_prompt
 from app.agents.schemas import TimewebAgentResponse
 from app.agents.timeweb_client import TimewebClient, TimewebClientError
@@ -15,6 +21,7 @@ from app.domain.enums import AgentType, ResponseMode
 from app.logging import get_logger
 from app.services.knowledge_level import LEVEL_INSTRUCTIONS, KnowledgeLevel
 from app.services.metrics import stage
+from app.services.usage_service import UsageService
 
 logger = get_logger(__name__)
 
@@ -49,9 +56,10 @@ class MainExpertAgent:
     ) -> TimewebAgentResponse | None:
         if str(response_mode) == ResponseMode.DEEP:
             mode_instruction = (
-                "Response mode: detailed. Explain the mechanism, steps, options, risks, "
-                "and practical limitations. Stay within the output budget without repeating "
-                "the same conclusion."
+                "Response mode: detailed. Give a complete technological analysis: formulation, "
+                "quantities, parameters, mechanism, stages, control, risks, storage and diagnosis "
+                "when relevant to this question. Do not force irrelevant sections or pad the "
+                "answer. Preserve food-safety requirements and finish naturally without repeats."
             )
             max_output_tokens = self.settings.deep_max_output_tokens
         else:
@@ -129,18 +137,125 @@ class MainExpertAgent:
         parts.append(f"Current user question — answer this now:\n{question}")
         message = "\n\n".join(part for part in parts if part)
 
-        started = datetime.now(UTC)
-        try:
+        return await self._generate(
+            repo,
+            message,
+            max_output_tokens,
+            session_id,
+            question_id,
+            request_id,
+            str(response_mode),
+        )
+
+    async def _generate(
+        self, repo, message, max_output_tokens, session_id, question_id, request_id, response_mode
+    ):
+        state = await repo.get_generation_state(question_id)
+        state = state if isinstance(state, dict) else {}
+        progress = state.get("progress") or {
+            "message": message,
+            "agent_id": self.settings.timeweb_agent_3_id,
+            "limit": max_output_tokens,
+            "max_continuations": self.settings.deep_max_continuations
+            if response_mode == ResponseMode.DEEP
+            else 0,
+            "started_at": datetime.now(UTC).isoformat(),
+            "fragments": [],
+            "attempts": 0,
+            "in_flight": False,
+        }
+        state["progress"] = progress
+
+        async def checkpoint():
+            await repo.save_generation_state(question_id, state)
             await repo.before_external()
-            with stage(
-                "expert_generation", question_id=str(question_id), response_mode=str(response_mode)
-            ):
-                call = await self.client.call_agent(
-                    agent_id=self.settings.timeweb_agent_3_id,
-                    token=self.settings.timeweb_agent_3_token,
-                    message=message,
-                    max_output_tokens=max_output_tokens,
+
+        if progress.get("in_flight"):
+            # A crash may have happened after the provider accepted/billed the call.
+            # Without provider idempotency/retrieval, replay is unsafe.
+            await self._record_usage(
+                repo,
+                session_id,
+                question_id,
+                datetime.fromisoformat(progress["call_started_at"]),
+                None,
+                success=False,
+                error_code="outcome_unknown",
+                request_id=request_id,
+                response_mode=response_mode,
+            )
+            progress.update(in_flight=False, terminal="outcome_unknown")
+            await checkpoint()
+        if progress["agent_id"] != self.settings.timeweb_agent_3_id:
+            progress["terminal"] = "agent_changed"
+            await checkpoint()
+
+        while not progress.get("terminal"):
+            fragments = progress["fragments"]
+            previous = fragments[-1]["assembled"] if fragments else ""
+            if fragments:
+                last = fragments[-1]
+                if last["finish_reason"] not in INCOMPLETE_REASONS:
+                    progress["terminal"] = (
+                        "complete"
+                        if last["finish_reason"] in {"stop", "completed"}
+                        else "completion_unconfirmed"
+                    )
+                    break
+                if last["finish_reason"] not in TOKEN_LIMIT_REASONS:
+                    progress["terminal"] = "provider_incomplete"
+                    break
+                if progress["attempts"] >= 1 + progress["max_continuations"]:
+                    progress["terminal"] = "continuation_limit"
+                    break
+                if await UsageService(self.settings).is_budget_exceeded(repo):
+                    progress["terminal"] = "budget_limit"
+                    break
+            started = datetime.now(UTC)
+            progress.update(
+                in_flight=True,
+                attempts=progress["attempts"] + 1,
+                call_started_at=started.isoformat(),
+            )
+            await checkpoint()
+            try:
+                with stage(
+                    "expert_generation",
+                    question_id=str(question_id),
+                    response_mode=response_mode,
+                    requested_output_tokens=progress["limit"],
+                    continuation_index=progress["attempts"] - 1,
+                ):
+                    call = await self.client.call_agent(
+                        agent_id=progress["agent_id"],
+                        token=self.settings.timeweb_agent_3_token,
+                        message=continuation_message(progress["message"], previous)
+                        if fragments
+                        else progress["message"],
+                        max_output_tokens=progress["limit"],
+                    )
+            except TimewebClientError as exc:
+                await self._record_usage(
+                    repo,
+                    session_id,
+                    question_id,
+                    started,
+                    None,
+                    success=False,
+                    error_code=getattr(exc, "error_code", "client_error"),
+                    request_id=request_id,
+                    response_mode=response_mode,
                 )
+                progress.update(in_flight=False, terminal="provider_error")
+                await checkpoint()
+                logger.error(
+                    "agent3_failed",
+                    error_code=getattr(exc, "error_code", "client_error"),
+                    status_code=getattr(exc, "status_code", None),
+                    response_mode=response_mode,
+                    continuation_index=progress["attempts"] - 1,
+                )
+                break
             estimated = self.settings.agent_3_estimated_cost_rub
             if call.used_web_search:
                 estimated += self.settings.web_search_estimated_cost_rub
@@ -153,38 +268,74 @@ class MainExpertAgent:
                 success=True,
                 estimated_cost=estimated,
                 request_id=request_id,
-                response_mode=str(response_mode),
+                response_mode=response_mode,
             )
-            if not call.message.strip():
-                return None
-            return TimewebAgentResponse(
-                text=call.message,
-                response_id=call.response_id,
-                finish_reason=call.finish_reason,
-                input_tokens=call.input_tokens,
+            assembled = join_fragment(previous, call.message)
+            fragments.append(
+                {
+                    "assembled": assembled,
+                    "response_id": call.response_id,
+                    "finish_reason": call.finish_reason,
+                    "input_tokens": call.input_tokens,
+                    "output_tokens": call.output_tokens,
+                    "actual_cost_rub": call.actual_cost_rub,
+                    "used_web_search": call.used_web_search,
+                }
+            )
+            progress["in_flight"] = False
+            if not call.message.strip() or assembled == previous:
+                progress["terminal"] = "no_progress"
+            logger.info(
+                "expert_fragment_finished",
+                question_id=str(question_id),
+                response_mode=response_mode,
+                requested_output_tokens=progress["limit"],
                 output_tokens=call.output_tokens,
-                actual_cost_rub=call.actual_cost_rub,
-                used_web_search=call.used_web_search,
+                finish_reason=call.finish_reason,
+                continuation_index=progress["attempts"] - 1,
+                duration_ms=call.latency_ms,
             )
-        except TimewebClientError as exc:
-            await self._record_usage(
-                repo,
-                session_id,
-                question_id,
-                started,
-                None,
-                success=False,
-                error_code=getattr(exc, "error_code", "client_error"),
-                request_id=request_id,
-                response_mode=str(response_mode),
-            )
-            logger.error(
-                "agent3_failed",
-                error=str(exc),
-                agent_id=self.settings.timeweb_agent_3_id,
-                status_code=getattr(exc, "status_code", None),
-            )
+            await checkpoint()
+
+        await checkpoint()
+        fragments = progress["fragments"]
+        complete = progress.get("terminal") == "complete"
+        duration = (
+            datetime.now(UTC) - datetime.fromisoformat(progress["started_at"])
+        ).total_seconds()
+        logger.info(
+            "expert_answer_finished",
+            question_id=str(question_id),
+            response_mode=response_mode,
+            requested_output_tokens=progress["limit"],
+            output_tokens=sum(f["output_tokens"] for f in fragments)
+            if fragments and all(f["output_tokens"] is not None for f in fragments)
+            else None,
+            finish_reason=fragments[-1]["finish_reason"] if fragments else None,
+            continuation_count=max(0, progress["attempts"] - 1),
+            duration_ms=round(duration * 1000),
+            completed=complete,
+            completion_status=progress.get("terminal"),
+        )
+        if not fragments or not fragments[-1]["assembled"].strip():
             return None
+
+        def total(field):
+            values = [f[field] for f in fragments if f[field] is not None]
+            return sum(values) if values else None
+
+        return TimewebAgentResponse(
+            text=fragments[-1]["assembled"],
+            response_id=fragments[-1]["response_id"],
+            finish_reason=fragments[-1]["finish_reason"],
+            is_complete=complete,
+            continuation_count=max(0, progress["attempts"] - 1),
+            incomplete_reason=None if complete else progress.get("terminal"),
+            input_tokens=total("input_tokens"),
+            output_tokens=total("output_tokens"),
+            actual_cost_rub=total("actual_cost_rub"),
+            used_web_search=any(f["used_web_search"] for f in fragments),
+        )
 
     async def _record_usage(
         self,

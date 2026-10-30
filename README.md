@@ -22,6 +22,7 @@ Production-oriented bot with:
 User instructions: `docs/USER_GUIDE.md`. Diagnostics, migration notes and validation: `docs/CHANGE_DIAGNOSTICS.md`.
 Post-release response latency investigation: `docs/LATENCY_DIAGNOSTICS.md`.
 Response speed and Telegram layout fixes: `docs/RESPONSE_SPEED_AND_LAYOUT.md`.
+Quick/Deep budgets, durable continuation and recovery: `docs/DEEP_CONTINUATION.md`.
 Approved agent prompts and synchronization: `docs/TIMEWEB_AGENT_PROMPTS.md`.
 
 See `docs/IMPLEMENTATION_PLAN.md`, `docs/ARCHITECTURE.md`, and
