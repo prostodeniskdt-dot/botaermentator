@@ -167,6 +167,27 @@ async def test_upgrade_preserves_existing_dialogue_profile_credits_and_queue():
             assert (
                 await conn.execute(text("SELECT generation_state FROM user_questions"))
             ).scalar_one() == {}
+        await migrate("downgrade", "008_expert_checkpoint")
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    "INSERT INTO telegram_delivery_parts(id,delivery_job_id,part_index,text,"
+                    "format,state,telegram_message_id) VALUES(:id,:job,0,'<b>Старый ответ</b>',"
+                    "'html','sent',42)"
+                ),
+                {"id": uuid.uuid4(), "job": ids["telegram_delivery_jobs"]},
+            )
+        await migrate("upgrade", "head")
+        async with engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT text,format,state,telegram_message_id,payload "
+                        "FROM telegram_delivery_parts"
+                    )
+                )
+            ).one()
+            assert tuple(row) == ("<b>Старый ответ</b>", "html", "sent", 42, {})
         await migrate("downgrade", "005_unlimited_access")
         assert await snapshot() == before
         await migrate("upgrade", "head")

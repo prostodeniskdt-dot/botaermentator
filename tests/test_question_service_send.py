@@ -113,7 +113,9 @@ async def test_send_answer_parts_falls_back_to_html(settings: Settings) -> None:
     service = _service(settings)
     bot = AsyncMock()
     bot.send_rich_message = AsyncMock(
-        side_effect=TelegramBadRequest(method=MagicMock(), message="Bad Request: rich failed")
+        side_effect=TelegramBadRequest(
+            method=MagicMock(), message="Bad Request: can't parse rich message"
+        )
     )
     bot.send_message = AsyncMock(return_value=MagicMock(message_id=2))
     await service._send_answer_parts(bot, _message(), "plain answer")
@@ -135,3 +137,46 @@ async def test_send_answer_parts_html_when_rich_disabled(settings: Settings) -> 
     kwargs = bot.send_message.await_args.kwargs
     assert kwargs["parse_mode"] == ParseMode.HTML
     assert kwargs["reply_to_message_id"] == 42
+
+
+async def test_direct_editorial_path_uses_same_native_table_plan(settings):
+    settings.answer_renderer = "editorial"
+    settings.rich_messages_enabled = True
+    service = _service(settings)
+    bot = AsyncMock()
+    bot.send_rich_message.return_value = MagicMock(message_id=90)
+    text = "## Параметры\n\n|Показатель|Значение|\n|---|---|\n|Температура|22 °C|"
+    await service._send_answer_parts(bot, _message(), text)
+    rich = bot.send_rich_message.call_args.kwargs["rich_message"]
+    assert rich.blocks[0].type == "heading" and rich.blocks[1].type == "table"
+    bot.send_message.assert_not_awaited()
+
+
+async def test_direct_editorial_fallback_can_send_multiple_html_parts(settings):
+    settings.answer_renderer = "editorial"
+    settings.rich_messages_enabled = True
+    service = _service(settings)
+    bot = AsyncMock()
+    bot.send_rich_message.side_effect = TelegramBadRequest(
+        method=MagicMock(), message="can't parse rich message"
+    )
+    bot.send_message.return_value = MagicMock(message_id=91)
+    text = "\n\n".join(f"**Пункт {n}**: контролируйте параметры." for n in range(250))
+    await service._send_answer_parts(bot, _message(), text)
+    assert bot.send_rich_message.await_count == 1
+    assert bot.send_message.await_count > 2
+    assert all(c.kwargs["parse_mode"] == ParseMode.HTML for c in bot.send_message.call_args_list)
+    assert "reply_to_message_id" in bot.send_message.call_args_list[0].kwargs
+    assert all("reply_to_message_id" not in c.kwargs for c in bot.send_message.call_args_list[1:])
+
+
+async def test_direct_rich_routing_error_does_not_fallback(settings):
+    settings.answer_renderer = "editorial"
+    settings.rich_messages_enabled = True
+    bot = AsyncMock()
+    bot.send_rich_message.side_effect = TelegramBadRequest(
+        method=MagicMock(), message="chat not found"
+    )
+    with pytest.raises(TelegramBadRequest):
+        await _service(settings)._send_answer_parts(bot, _message(), "Содержательный ответ.")
+    bot.send_message.assert_not_awaited()

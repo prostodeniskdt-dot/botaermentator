@@ -357,6 +357,7 @@ class TelegramDeliveryPart(Base):
     text: Mapped[str] = mapped_column(Text)
     format: Mapped[str] = mapped_column(String(16))
     state: Mapped[str] = mapped_column(String(24), default="pending")
+    payload: Mapped[dict] = mapped_column(JSONB, default=dict, server_default="{}")
     telegram_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
 
