@@ -85,7 +85,9 @@ def main():
     parser.add_argument("--topic-id", type=int)
     parser.add_argument("--check-button", action="store_true")
     parser.add_argument(
-        "--example", choices=["all", "quick", "deep", "research", "mixed"], default="all"
+        "--example",
+        choices=["all", "quick", "deep", "research", "mixed", "recipe_comparison"],
+        default="all",
     )
     args = parser.parse_args()
     try:

@@ -10,10 +10,47 @@ _LABEL = re.compile(
     re.IGNORECASE,
 )
 
+# Only isolated, familiar section labels in a substantial document are promoted.
+# No generated titles, guessing from numbers, or rewriting of instructions.
+_SECTIONS = frozenset(
+    {
+        "базовые ориентиры",
+        "варианты рецептов",
+        "технология приготовления",
+        "карбонизация",
+        "фильтрация и осветление",
+        "контроль и диагностика",
+        "хранение",
+        "самый удачный стартовый вариант",
+        "ингредиенты",
+        "параметры",
+        "этапы",
+        "подготовка",
+        "приготовление",
+        "контроль",
+        "диагностика",
+        "источники",
+        "ограничения безопасности",
+        "риски",
+        "рекомендации по хранению",
+    }
+)
+
 
 def editorial_rules(document: Document) -> Document:
+    substantial = len(document.source) >= 1200
+
     def apply(block: Block) -> Block:
         content = block.content
+        if (
+            substantial
+            and block.kind == "paragraph"
+            and content
+            and all(node.kind == "text" for node in content)
+        ):
+            title = block.plain.strip()
+            if "\n" not in title and title.rstrip(":").casefold() in _SECTIONS:
+                block = replace(block, kind="heading", level=2)
         if block.kind == "paragraph" and content and content[0].kind == "text":
             match = _LABEL.match(content[0].text)
             if match:

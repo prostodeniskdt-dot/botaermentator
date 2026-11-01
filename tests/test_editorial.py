@@ -330,4 +330,4 @@ def test_switch_disabled_keeps_legacy_and_metrics_do_not_contain_private_materia
     editorial.answer_renderer = "editorial"
     editorial.rich_messages_enabled = False
     assert all(p.format == "html" for p in build_plan(text, editorial))
-    assert parts[0].version == "fermentator-editorial-1"
+    assert parts[0].version == "fermentator-editorial-2"

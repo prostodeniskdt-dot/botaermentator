@@ -129,6 +129,7 @@ configure Group Privacy consistently with the group scenario and test it before 
 - `/admin_unblock_user <telegram_user_id>`
 - `/admin_cost_today`
 - `/admin_latency` — timings of your last three requests, including queue/receipt, model and delivery
+- `/admin_format` — active formatting flags, renderer version and own recent delivery formats/fallbacks
 - `/admin_kill_switch_on` / `/admin_kill_switch_off`
 
 Credits are internal accounting units. There is no payment or Telegram Stars integration.

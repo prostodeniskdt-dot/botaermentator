@@ -73,6 +73,7 @@ async def test_send_message_reraises_other_bad_requests() -> None:
 
 @pytest.mark.asyncio
 async def test_send_answer_parts_uses_rich_markdown(settings: Settings) -> None:
+    settings.answer_renderer = "legacy"
     settings.rich_messages_enabled = True
     service = _service(settings)
     bot = AsyncMock()

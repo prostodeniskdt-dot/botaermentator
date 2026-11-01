@@ -81,7 +81,7 @@ class Settings(BaseSettings):
     answer_cache_min_question_len: int = 10
 
     rich_messages_enabled: bool = False
-    answer_renderer: Literal["legacy", "editorial"] = "legacy"
+    answer_renderer: Literal["legacy", "editorial"] = "editorial"
 
     private_access_enabled: bool = True
     access_contact_username: str = "pprostodenis"

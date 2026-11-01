@@ -14,6 +14,7 @@ from app.agents.schemas import TimewebAgentResponse
 from app.db.models.entities import BotResponse, CreditAccount, TelegramDeliveryPart
 from app.db.repositories import Repository
 from app.services.answer_expansion_service import AnswerExpansionService
+from app.services.formatting_report import formatting_report
 from tests.test_postgres_workflows import (
     add_user,
     ask,
@@ -288,3 +289,46 @@ async def test_cached_markdown_uses_current_editorial_without_any_expert_call(db
         response = (await db.execute(select(BotResponse))).scalar_one()
         assert response.response_text.startswith(raw)
         assert (await db.execute(select(CreditAccount))).scalar_one().balance == 50
+
+
+async def test_long_recipe_table_fallback_and_diagnostics_keep_rows_and_own_data(
+    db_factory, service
+):
+    from pathlib import Path
+
+    from app.bot.formatting.editorial.parser import ResponseParser
+    from tests.test_editorial import visible
+
+    await add_user(db_factory)
+    await add_user(db_factory, user_id=8)
+    service.settings.answer_renderer = "legacy"  # Old explicit environment setting.
+    service.settings.rich_messages_enabled = True
+    source = (Path(__file__).parent / "fixtures/editorial/recipe_comparison.md").read_text()
+    service.main_expert.answer.side_effect = None
+    service.main_expert.answer.return_value = TimewebAgentResponse(text=source)
+    bot = bot_mock()
+    await ask(db_factory, service, bot)
+    job = await claim_delivery(db_factory)
+    bot.send_rich_message.side_effect = TelegramBadRequest(
+        method=AsyncMock(), message="can't parse rich message"
+    )
+    await finish_delivery(db_factory, service, bot, job)
+    assert bot.send_rich_message.await_count == 1
+    async with db_factory() as db:
+        repo = Repository(db)
+        rows = await repo.delivery_parts(job.id)
+        messages = [visible(p.text) for p in rows if p.state == "sent"]
+        for block in ResponseParser().parse(source).blocks:
+            if block.kind == "table":
+                for row in block.rows[1:]:
+                    assert any(
+                        all(cell.content[0].plain in message for cell in row)
+                        for message in messages
+                    )
+        report = await formatting_report(db, 7)
+        assert "fermentator-editorial-2" in report
+        assert "rich_blocks" in report and "html ×" in report
+        assert "rich_format_or_capability_rejected" in report
+        assert "Состав-А" not in report
+        assert "Сохранённых доставок" in await formatting_report(db, 8)
+        assert (await db.execute(select(BotResponse))).scalar_one().response_text == source

@@ -21,6 +21,17 @@ def _is_admin(message: Message, settings) -> bool:
     return bool(message.from_user and message.from_user.id in settings.admin_user_ids)
 
 
+@router.message(F.chat.type == "private", Command("admin_format"))
+async def admin_format(message: Message, settings) -> None:
+    if not _is_admin(message, settings):
+        return
+    from app.services.formatting_report import formatting_config, formatting_report
+
+    async with session_scope() as db:
+        report = await formatting_report(db, message.from_user.id)
+    await message.answer(formatting_config(settings) + "\n\n" + report, parse_mode=None)
+
+
 @router.message(F.chat.type == "private", Command("admin_latency"))
 async def admin_latency(message: Message, settings) -> None:
     if not _is_admin(message, settings):

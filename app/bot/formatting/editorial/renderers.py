@@ -164,7 +164,7 @@ def table_text_rows(block: Block):
             if title:
                 title.append(Inline(text=" · "))
             title.extend(cell.content)
-        result.append(Block("paragraph", content=tuple(title)))
+        result.append(Block("heading", content=tuple(title), level=3))
 
     for row in rows:
         content = []

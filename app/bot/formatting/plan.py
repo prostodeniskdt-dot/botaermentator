@@ -15,7 +15,7 @@ from app.bot.formatting.telegram_rich import prep_rich_markdown
 from app.logging import get_logger
 
 logger = get_logger(__name__)
-EDITORIAL_VERSION = "fermentator-editorial-1"
+EDITORIAL_VERSION = "fermentator-editorial-2"
 
 
 @dataclass(frozen=True)
@@ -35,12 +35,39 @@ def legacy_plan(text, *, rich_enabled):
 
 
 def html_plan(blocks):
-    from app.bot.formatting.editorial.renderers import html_block
+    from dataclasses import replace
+
+    from app.bot.formatting.editorial.renderers import html_block, table_text_rows
+
+    def units(block):
+        if block.kind == "table":
+            # A whole table is not one indivisible HTML string. Each row becomes
+            # one readable card; an ordinary row must never straddle messages.
+            yield from table_text_rows(block)
+        elif block.kind == "list" and utf16_length(html_block(block)) > 3800:
+            for index, item in enumerate(block.children):
+                single = replace(block, start=block.start + index, children=(item,))
+                if utf16_length(html_block(single)) <= 3800:
+                    yield single
+                else:
+                    for child in item.children:
+                        for unit in units(child):
+                            yield replace(single, children=(replace(item, children=(unit,)),))
+        elif block.children and utf16_length(html_block(block)) > 3800:
+            if block.label:
+                from app.bot.formatting.editorial.document import Block
+
+                yield Block("heading", content=block.label, level=3)
+            for child in block.children:
+                for unit in units(child):
+                    yield replace(block, children=(unit,), label=())
+        else:
+            yield block
 
     # Keep semantic blocks together; only oversized blocks need balanced HTML splitting.
     parts, current = [], ""
     index = 0
-    blocks = list(blocks)
+    blocks = [unit for block in blocks for unit in units(block)]
     while index < len(blocks):
         value = html_block(blocks[index])
         count = 1
@@ -67,7 +94,7 @@ def html_plan(blocks):
 
 
 def build_plan(text, settings):
-    if settings.answer_renderer == "legacy":
+    def old_plan():
         return [
             PlannedPart(
                 value,
@@ -77,6 +104,10 @@ def build_plan(text, settings):
             )
             for value, kind in legacy_plan(text, rich_enabled=settings.rich_messages_enabled)
         ]
+
+    legacy = settings.answer_renderer == "legacy"
+    if legacy and "|" not in text and "<table" not in text.lower():
+        return old_plan()
     from app.bot.formatting.editorial.parser import ResponseParser
     from app.bot.formatting.editorial.renderers import rich_block
     from app.bot.formatting.editorial.rules import editorial_rules
@@ -84,11 +115,20 @@ def build_plan(text, settings):
 
     started = perf_counter()
     try:
-        document = editorial_rules(ResponseParser().parse(text))
+        document = ResponseParser().parse(text)
     except (ValueError, AssertionError, RecursionError):
         fallback = split_html_message(escape_html(text))
         logger.warning("editorial_parse_failed", reason="malformed_document", markup_errors=1)
         return [PlannedPart(p, "html", {"text": p}, version=EDITORIAL_VERSION) for p in fallback]
+
+    def has_table(blocks):
+        return any(block.kind == "table" or has_table(block.children) for block in blocks)
+
+    if legacy and not has_table(document.blocks):
+        return old_plan()
+    # Explicit legacy settings must not turn a valid table into raw pipe text.
+    # Rich is still used only when its independent feature flag is enabled.
+    document = editorial_rules(document)
     parsed = perf_counter()
     parts, reason = [], None
     limits = Limits()
@@ -122,6 +162,8 @@ def build_plan(text, settings):
     logger.info(
         "editorial_plan_ready",
         renderer=EDITORIAL_VERSION,
+        configured_renderer=settings.answer_renderer,
+        table_compatibility=legacy,
         parse_ms=round((parsed - started) * 1000, 2),
         prepare_ms=round((finished - parsed) * 1000, 2),
         semantic_blocks=len(document.blocks),

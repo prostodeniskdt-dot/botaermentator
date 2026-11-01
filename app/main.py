@@ -20,6 +20,7 @@ from app.agents.timeweb_client import TimewebClient
 from app.api.health import router as health_router
 from app.api.telegram_webhook import create_webhook_router
 from app.bot.factory import build_services, create_bot, create_dispatcher
+from app.bot.formatting.plan import EDITORIAL_VERSION
 from app.config import clear_settings_cache, get_settings
 from app.db.session import check_database_connection, get_engine, reset_engine
 from app.logging import configure_logging, get_logger
@@ -49,7 +50,14 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     configure_logging(settings.log_level)
     logger = get_logger(__name__)
-    logger.info("app_starting", app_env=settings.app_env, version=__version__)
+    logger.info(
+        "app_starting",
+        app_env=settings.app_env,
+        version=__version__,
+        formatter_version=EDITORIAL_VERSION,
+        answer_renderer=settings.answer_renderer,
+        rich_messages_enabled=settings.rich_messages_enabled,
+    )
 
     missing = settings.missing_critical_settings()
     if settings.is_production and missing:
