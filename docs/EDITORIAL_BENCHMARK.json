@@ -1,0 +1,98 @@
+[
+  {
+    "example": "deep",
+    "characters": 814,
+    "legacy": {
+      "median_ms": 1.23,
+      "max_ms": 3.51,
+      "messages": 1,
+      "fallback_messages": 0
+    },
+    "editorial": {
+      "median_ms": 1.84,
+      "max_ms": 7.54,
+      "messages": 1,
+      "fallback_messages": 1
+    }
+  },
+  {
+    "example": "mixed",
+    "characters": 481,
+    "legacy": {
+      "median_ms": 0.23,
+      "max_ms": 0.44,
+      "messages": 1,
+      "fallback_messages": 0
+    },
+    "editorial": {
+      "median_ms": 2.32,
+      "max_ms": 2.86,
+      "messages": 1,
+      "fallback_messages": 1
+    }
+  },
+  {
+    "example": "quick",
+    "characters": 213,
+    "legacy": {
+      "median_ms": 0.44,
+      "max_ms": 0.69,
+      "messages": 1,
+      "fallback_messages": 0
+    },
+    "editorial": {
+      "median_ms": 0.78,
+      "max_ms": 0.95,
+      "messages": 1,
+      "fallback_messages": 1
+    }
+  },
+  {
+    "example": "research",
+    "characters": 536,
+    "legacy": {
+      "median_ms": 0.19,
+      "max_ms": 0.34,
+      "messages": 1,
+      "fallback_messages": 0
+    },
+    "editorial": {
+      "median_ms": 1.54,
+      "max_ms": 1.74,
+      "messages": 1,
+      "fallback_messages": 1
+    }
+  },
+  {
+    "example": "long-deep",
+    "characters": 6630,
+    "legacy": {
+      "median_ms": 7.66,
+      "max_ms": 8.92,
+      "messages": 2,
+      "fallback_messages": 0
+    },
+    "editorial": {
+      "median_ms": 10.05,
+      "max_ms": 11.74,
+      "messages": 1,
+      "fallback_messages": 3
+    }
+  },
+  {
+    "example": "large-table",
+    "characters": 15411,
+    "legacy": {
+      "median_ms": 12.27,
+      "max_ms": 13.0,
+      "messages": 5,
+      "fallback_messages": 0
+    },
+    "editorial": {
+      "median_ms": 62.82,
+      "max_ms": 133.87,
+      "messages": 2,
+      "fallback_messages": 6
+    }
+  }
+]

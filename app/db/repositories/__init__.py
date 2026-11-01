@@ -1418,17 +1418,16 @@ class Repository:
         return list(result.scalars())
 
     async def prepare_delivery_parts(self, job_id, parts):
-        for index, (text_value, format_value) in enumerate(parts):
+        from app.bot.formatting.plan import persistent_rows
+
+        rows = [
+            {"id": uuid.uuid4(), "delivery_job_id": job_id, "part_index": index, **row}
+            for index, row in enumerate(persistent_rows(parts))
+        ]
+        if rows:
             await self.session.execute(
                 insert(TelegramDeliveryPart)
-                .values(
-                    id=uuid.uuid4(),
-                    delivery_job_id=job_id,
-                    part_index=index,
-                    text=text_value,
-                    format=format_value,
-                    state="pending",
-                )
+                .values(rows)
                 .on_conflict_do_nothing(constraint="uq_delivery_part")
             )
         return await self.delivery_parts(job_id)

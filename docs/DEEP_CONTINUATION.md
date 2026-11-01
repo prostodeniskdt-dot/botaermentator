@@ -108,7 +108,8 @@ changing timeouts. Provider compatibility/quota errors do not silently lower the
 `expert_generation`, `expert_fragment_finished` and `expert_answer_finished` report mode, requested
 limit, returned output tokens when supplied, finish reason, continuation index/count, duration and
 completion status. Total duration includes recovery downtime; per-call durations remain separate.
-`expert_answer_persisted` reports completion, continuation count and planned Telegram part count.
+`expert_answer_persisted` reports completion and continuation count. Telegram part counts are
+reported by the versioned formatter/delivery events described in FERMENTATOR_EDITORIAL.md.
 Existing per-part delivery records track actual progress. The logs contain identifiers and metadata,
 not prompts, full questions, drafts or tokens/secrets. Missing provider token counts remain unknown.
 

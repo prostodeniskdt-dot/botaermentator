@@ -38,3 +38,4 @@ Thumbs.db
 app-logs-*.txt
 deploy-logs-*.txt
 .coverage.*
+/review/editorial/

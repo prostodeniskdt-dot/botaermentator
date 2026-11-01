@@ -7,7 +7,7 @@ import uuid
 
 from aiogram import Bot
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramNotFound
 from aiogram.types import (
     InputRichMessage,
     Message,
@@ -20,7 +20,7 @@ from app.agents.expert_continuation import TOKEN_LIMIT_REASONS, incomplete_respo
 from app.agents.industry_filter import IndustryFilterAgent
 from app.agents.main_expert import MainExpertAgent
 from app.agents.prompt_set import PROMPT_SET_VERSION, prompt_cache_version
-from app.bot.formatting.telegram_html import format_response_html
+from app.bot.formatting.plan import build_plan, rich_rejection_reason
 from app.bot.keyboards import private_menu_keyboard
 from app.bot.mention import AddressKind
 from app.config import Settings
@@ -37,7 +37,7 @@ from app.logging import get_logger
 from app.services.answer_cache import normalize_question_key
 from app.services.blocking_service import BlockingService
 from app.services.credit_service import CreditService
-from app.services.delivery_service import DeliveryService, delivery_plan
+from app.services.delivery_service import DeliveryService
 from app.services.knowledge_level import knowledge_level
 from app.services.message_content import clean_question, has_meaningful_text, supports_question
 from app.services.metrics import stage
@@ -716,9 +716,6 @@ class QuestionService:
             response_mode=str(question.response_mode),
             completed=response_status == "answered",
             continuation_count=max(0, progress.get("attempts", 1) - 1),
-            telegram_parts=len(
-                delivery_plan(text, rich_enabled=self.settings.rich_messages_enabled)
-            ),
         )
         # Keep private prompts/drafts only until atomic finalization has succeeded.
         question.generation_state = {}
@@ -943,7 +940,11 @@ class QuestionService:
             question = await repo.get_question(job.question_id)
             response = await repo.get_bot_response(job.bot_response_id)
             session = await repo.get_session(question.session_id) if question else None
-            delivered_parts = await repo.delivery_parts(job.id)
+            delivered_parts = [
+                p
+                for p in (parts or await repo.delivery_parts(job.id))
+                if getattr(p, "state", "sent") == "sent"
+            ]
             offer = None
             if (
                 job.is_private
@@ -1110,24 +1111,30 @@ class QuestionService:
 
     async def _send_answer_parts(self, bot: Bot, message: Message, text: str):
         first = None
-        for index, (part, format_value) in enumerate(
-            delivery_plan(text, rich_enabled=self.settings.rich_messages_enabled)
-        ):
+        for index, part in enumerate(build_plan(text, self.settings)):
             with stage("telegram_send", part_index=index):
-                if format_value == "rich":
+                if part.format in {"rich", "rich_blocks"}:
                     try:
-                        sent = await self._send_rich_message(bot, message, part, reply=index == 0)
-                    except TelegramBadRequest:
-                        sent = await self._send_message(
-                            bot,
-                            message,
-                            format_response_html(part),
-                            parse_mode=ParseMode.HTML,
-                            reply=index == 0,
+                        sent = await self._send_rich_message(
+                            bot, message, part.payload, reply=first is None
                         )
+                    except (TelegramBadRequest, TelegramNotFound) as exc:
+                        reason = rich_rejection_reason(exc)
+                        if reason is None:
+                            raise
+                        logger.info("editorial_direct_fallback", reason=reason, markup_errors=1)
+                        for value in part.fallback:
+                            sent = await self._send_message(
+                                bot,
+                                message,
+                                value,
+                                parse_mode=ParseMode.HTML,
+                                reply=first is None,
+                            )
+                            first = first or sent
                 else:
                     sent = await self._send_message(
-                        bot, message, part, parse_mode=ParseMode.HTML, reply=index == 0
+                        bot, message, part.text, parse_mode=ParseMode.HTML, reply=first is None
                     )
             first = first or sent
         return first
@@ -1136,13 +1143,15 @@ class QuestionService:
     async def _send_rich_message(
         bot: Bot,
         message: Message,
-        markdown: str,
+        markdown: str | dict,
         *,
         reply: bool = False,
     ):
         kwargs: dict = {
             "chat_id": message.chat.id,
-            "rich_message": InputRichMessage(markdown=markdown),
+            "rich_message": InputRichMessage.model_validate(markdown)
+            if isinstance(markdown, dict)
+            else InputRichMessage(markdown=markdown),
             "message_thread_id": message.message_thread_id,
         }
         if message.chat.type == "private" and reply:
