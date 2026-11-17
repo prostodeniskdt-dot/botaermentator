@@ -379,3 +379,28 @@ async def admin_payment_resolve(message: Message, settings) -> None:
             "/admin_payment_resolve <order UUID> <Telegram ID> CONFIRM. "
             "Зафиксированного получателя менять нельзя."
         )
+
+
+@router.message(F.chat.type == "private", Command("admin_payment_schema"))
+async def admin_payment_schema(message: Message, settings) -> None:
+    if not _is_admin(message, settings) or message.chat.type != "private":
+        return
+    from app.db.models.entities import PurchaseOrder
+    from app.services.payment_diagnostics import payment_schema_report
+
+    parts = (message.text or "").split()
+    try:
+        if len(parts) != 2:
+            raise ValueError()
+        order_id = uuid.UUID(parts[1])
+    except ValueError:
+        await message.answer("Использование: /admin_payment_schema <UUID заказа>", parse_mode=None)
+        return
+    async with session_scope() as db:
+        order = await db.get(PurchaseOrder, order_id)
+        reports = payment_schema_report(order) if order is not None else None
+    if reports is None:
+        await message.answer("Заказ не найден. Проверьте UUID из уведомления.", parse_mode=None)
+        return
+    for report in reports:
+        await message.answer(report, parse_mode=None)
