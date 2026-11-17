@@ -404,3 +404,49 @@ async def admin_payment_schema(message: Message, settings) -> None:
         return
     for report in reports:
         await message.answer(report, parse_mode=None)
+
+
+@router.message(F.chat.type == "private", Command("admin_payment_audit"))
+async def admin_payment_audit(message: Message, settings) -> None:
+    if not _is_admin(message, settings) or message.chat.type != "private":
+        return
+    import httpx
+
+    from app.db.models.entities import PurchaseOrder
+    from app.services.payment_audit import audit_provider, audit_report
+
+    parts = (message.text or "").split()
+    try:
+        if len(parts) != 2:
+            raise ValueError()
+        order_id = uuid.UUID(parts[1])
+    except ValueError:
+        await message.answer("Использование: /admin_payment_audit <UUID заказа>", parse_mode=None)
+        return
+    async with session_scope() as db:
+        order = await db.get(PurchaseOrder, order_id)
+        candidate = (order.details or {}).get("audit_input") if order else None
+    if order is None:
+        await message.answer("Заказ не найден.", parse_mode=None)
+        return
+    if not candidate:
+        await message.answer(
+            "В старой записи сохранена только структура без значений. "
+            "После обновления нужен новый Webhook: повторная отправка прежнего заказа из Tilda, "
+            "если она доступна. Не повторяйте оплату автоматически.",
+            parse_mode=None,
+        )
+        return
+    async with httpx.AsyncClient(follow_redirects=False) as client:
+        report = await audit_provider(candidate, settings, client)
+    # Audit evidence cannot change status, recipient, queue, provider ID or ledger.
+    async with session_scope() as db:
+        order = await db.get(PurchaseOrder, order_id, with_for_update=True)
+        if order is not None:
+            order.details = {
+                **order.details,
+                "audit_result": report,
+                "audit_checked_by": message.from_user.id,
+            }
+    for part in audit_report(order_id, candidate, report):
+        await message.answer(part, parse_mode=None)

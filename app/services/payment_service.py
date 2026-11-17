@@ -20,15 +20,19 @@ from app.db.models.entities import CreditTransaction, PaymentNotice, PurchaseOrd
 from app.db.repositories import Repository
 from app.db.session import session_scope
 from app.services.payment_email import normalize_email
+from app.services.tilda_payload import normalize_tilda_payload
 
 
 def path(data, key):
     if isinstance(data, dict) and key in data:
         return data[key]
-    for part in key.split("."):
-        if not isinstance(data, dict) or part not in data:
+    for part in key.replace("]", "").replace("[", ".").split("."):
+        if isinstance(data, list) and part.isdigit() and int(part) < len(data):
+            data = data[int(part)]
+        elif isinstance(data, dict) and part in data:
+            data = data[part]
+        else:
             raise ValueError("missing_field")
-        data = data[part]
     return data
 
 
@@ -43,6 +47,7 @@ def money(value):
 
 
 def parse_order(payload, contract):
+    payload = normalize_tilda_payload(payload)
     if not contract.get("audit_reference"):
         raise ValueError("schema_not_audited")
     payment_id = str(path(payload, contract["payment_id"]))
@@ -91,8 +96,10 @@ async def review(db, order, settings, code):
 
 
 async def receive_order(db, payload, settings, event_key):
-    # Store only shape in diagnostics. No arbitrary form values, secrets or raw PII.
-    details = {"shape": shape(payload)}
+    # Diagnostics retain shape plus whitelisted technical evidence, never arbitrary form/PII.
+    from app.services.payment_audit import capture_audit_input
+
+    details = {"shape": shape(payload), "audit_input": capture_audit_input(payload)}
     parsed = None
     code = "schema_not_audited"
     try:
@@ -111,7 +118,7 @@ async def receive_order(db, payload, settings, event_key):
             lead_id=parsed["lead_id"][:128],
             email_normalized=parsed["email"],
         )
-        values["details"] = parsed
+        values["details"] = {**parsed, "audit_input": details["audit_input"]}
     await db.execute(insert(PurchaseOrder).values(**values).on_conflict_do_nothing())
     query = (
         PurchaseOrder.payment_id == parsed["payment_id"]
@@ -127,6 +134,9 @@ async def receive_order(db, payload, settings, event_key):
             await review(db, order, settings, "conflicting_replay")
         return order
     if order.status != "received" or order.credited_at is not None:
+        if not parsed and not order.details.get("audit_input") and not order.credited_at:
+            # The exact authenticated body is resent: fill previously unsaved audit evidence only.
+            order.details = {**order.details, **details}
         return order
     if not parsed:
         await review(db, order, settings, code)
@@ -177,11 +187,25 @@ def shape(value, depth=0):
             "payment[amount]",
             "payment[products]",
             "payment[currency]",
+            "payment[sys]",
+            "sys",
+            "price",
+            "name",
+            "order_id",
+            "tilda_order_id",
+            "tilda_orderid",
+            "metadata",
         }
         return {
-            (k if k in known else "key_" + hashlib.sha256(k.encode()).hexdigest()[:12]): shape(
-                v, depth + 1
-            )
+            (
+                k
+                if k in known
+                or re.fullmatch(
+                    r"payment\[products\]\[\d{1,2}\]\[(?:externalid|sku|uid|name|price|quantity|amount)\]",
+                    k,
+                )
+                else "key_" + hashlib.sha256(k.encode()).hexdigest()[:12]
+            ): shape(v, depth + 1)
             for k, v in value.items()
         }
     if isinstance(value, list):
