@@ -9,6 +9,14 @@ from app.db.repositories import Repository
 from app.domain.enums import ResponseMode
 
 
+def has_unlimited_credits(settings, telegram_user_id, user) -> bool:
+    if getattr(user, "admin_credits_limited", False) is True:
+        return False
+    return (
+        telegram_user_id in settings.admin_user_ids or getattr(user, "is_unlimited", False) is True
+    )
+
+
 class CreditService:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -30,10 +38,8 @@ class CreditService:
         amount = self.cost_for_mode(mode) if amount is None else amount
         if amount < 0:
             raise ValueError("Credit amount must be non-negative")
-        if telegram_user_id in self.settings.admin_user_ids:
-            return 0
         user = await repo.get_user_by_telegram_id(telegram_user_id)
-        if user is not None and user.is_unlimited is True:
+        if has_unlimited_credits(self.settings, telegram_user_id, user):
             return 0
         if await repo.reserve_credits(telegram_user_id, request_id, amount):
             return amount

@@ -279,7 +279,13 @@ async def admin_user(message: Message, settings) -> None:
     if user is None:
         await message.answer("Пользователь не найден.")
         return
-    balance = "безлимитный" if user.is_unlimited is True else str(account.balance)
+    from app.services.credit_service import has_unlimited_credits
+
+    balance = (
+        "безлимитный"
+        if has_unlimited_credits(settings, user.telegram_user_id, user)
+        else str(account.balance)
+    )
     await message.answer(
         f"ID: {user.telegram_user_id}\n"
         f"Username: @{user.username or '-'}\n"

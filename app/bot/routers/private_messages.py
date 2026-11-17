@@ -35,6 +35,7 @@ from app.domain.messages import (
     WELCOME,
     balance_text,
 )
+from app.services.credit_service import has_unlimited_credits
 from app.services.knowledge_level import LEVEL_LABELS, KnowledgeLevel, knowledge_level
 from app.services.message_content import clean_question, has_meaningful_text, supports_question
 
@@ -176,11 +177,7 @@ async def private_balance(message: Message, settings, bot, access_service) -> No
     user = await _active_user(message, settings, bot, access_service)
     if not user:
         return
-    if (
-        message.from_user
-        and message.from_user.id in settings.admin_user_ids
-        or user.is_unlimited is True
-    ):
+    if has_unlimited_credits(settings, user.telegram_user_id, user):
         await _answer(message, BALANCE_UNLIMITED)
         return
     async with session_scope() as db:
