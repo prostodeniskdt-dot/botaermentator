@@ -19,6 +19,7 @@ from sqlalchemy.dialects.postgresql import insert
 from app.db.models.entities import CreditTransaction, PaymentNotice, PurchaseOrder, TelegramUser
 from app.db.repositories import Repository
 from app.db.session import session_scope
+from app.services.payment_catalog import CREDITS_BY_EXTERNAL_ID
 from app.services.payment_email import normalize_email
 from app.services.tilda_payload import normalize_tilda_payload
 
@@ -63,18 +64,33 @@ def parse_order(payload, contract):
     if str(quantity) != "1":
         raise ValueError("unsupported_quantity")
     order_id = str(path(payload, contract["order_id"]))
-    lead_id = str(path(payload, contract["lead_id"]))
-    if not order_id or not lead_id or len(order_id) > 128 or len(lead_id) > 128:
+    lead_path = contract.get("lead_id")
+    lead_id = str(path(payload, lead_path)) if lead_path else None
+    if (
+        not order_id
+        or len(order_id) > 128
+        or (lead_id is not None and (not lead_id or len(lead_id) > 128))
+    ):
         raise ValueError("invalid_order_identifiers")
-    return {
+    try:
+        currency = str(path(payload, contract["currency"]))
+    except ValueError:
+        if contract.get("currency_fallback") != "RUB":
+            raise
+        currency = "RUB"
+    result = {
         "payment_id": payment_id,
         "order_id": order_id,
         "lead_id": lead_id,
         "email": normalize_email(str(path(payload, contract["email"]))),
         "sku": str(path(product, contract["sku"])),
         "amount": money(path(payload, contract["amount"])),
-        "currency": str(path(payload, contract["currency"])),
+        "currency": currency,
     }
+    for field in ("line_price", "line_amount"):
+        if contract.get(field):
+            result[field + "_kopecks"] = money(path(product, contract[field]))
+    return result
 
 
 async def review(db, order, settings, code):
@@ -115,7 +131,7 @@ async def receive_order(db, payload, settings, event_key):
         values.update(
             payment_id=parsed["payment_id"],
             order_id=parsed["order_id"][:128],
-            lead_id=parsed["lead_id"][:128],
+            lead_id=parsed["lead_id"][:128] if parsed["lead_id"] else None,
             email_normalized=parsed["email"],
         )
         values["details"] = {**parsed, "audit_input": details["audit_input"]}
@@ -220,6 +236,18 @@ def verify_payment(order, provider, settings):
     if not package or not package.get("audit_reference"):
         raise ValueError("unknown_package")
     if (
+        type(package.get("amount_kopecks")) is not int
+        or package["amount_kopecks"] <= 0
+        or package.get("currency", "RUB") != "RUB"
+    ):
+        raise ValueError("invalid_package")
+    expected_credits = CREDITS_BY_EXTERNAL_ID.get(data["sku"])
+    if expected_credits is not None and package.get("credits") != expected_credits:
+        raise ValueError("invalid_package")
+    for field in ("line_price_kopecks", "line_amount_kopecks"):
+        if field in data and data[field] != package["amount_kopecks"]:
+            raise ValueError("amount_or_currency_mismatch")
+    if (
         provider.get("id") != order.payment_id
         or provider.get("test") is not False
         or provider.get("recipient", {}).get("account_id") != settings.yookassa_shop_id
@@ -238,10 +266,11 @@ def verify_payment(order, provider, settings):
         or data["amount"] != package["amount_kopecks"]
     ):
         raise ValueError("amount_or_currency_mismatch")
+    provider_order_path = data.get("provider_order_path") or contract.get("provider_order_id")
     if (
-        not data["order_id"]
-        or str(path(provider, data.get("provider_order_path", contract["provider_order_id"])))
-        != data["order_id"]
+        not isinstance(provider_order_path, str)
+        or not data["order_id"]
+        or str(path(provider, provider_order_path)) != data["order_id"]
     ):
         raise ValueError("order_mismatch")
     credits = package["credits"]

@@ -5,10 +5,11 @@ import re
 from contextlib import suppress
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
+from types import SimpleNamespace
 
 import httpx
 
-from app.services.payment_service import money, path, shape
+from app.services.payment_service import money, path, shape, verify_payment
 from app.services.tilda_payload import normalize_tilda_payload
 
 _ID = re.compile(r"[A-Za-z0-9_:-]{1,128}")
@@ -122,6 +123,28 @@ async def audit_provider(candidate, settings, client):
                 report["configured_order_path_matches"] = (
                     str(path(provider, configured_path)) == order_id
                 )
+        report["configured_package_valid"] = False
+        products = candidate.get("products", [])
+        if settings.payments_packages and len(products) == 1 and products[0].get("quantity") == "1":
+            product = products[0]
+            contract = settings.payments_contract
+            try:
+                data = {
+                    "sku": path(product, contract["sku"]),
+                    "order_id": order_id,
+                    "amount": candidate.get("amount_kopecks"),
+                    "currency": candidate.get("currency") or contract.get("currency_fallback"),
+                }
+                for field in ("line_price", "line_amount"):
+                    if contract.get(field):
+                        data[field + "_kopecks"] = money(path(product, contract[field]))
+                verified = verify_payment(
+                    SimpleNamespace(details=data, payment_id=payment_id), provider, settings
+                )
+                report["configured_package_valid"] = True
+                report["verified_credits"] = verified
+            except (ValueError, KeyError, TypeError, AttributeError, InvalidOperation):
+                report["configured_package_valid"] = False
         report["activation_allowed"] = False
         return report
     except httpx.HTTPError:
