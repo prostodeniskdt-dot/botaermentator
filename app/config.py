@@ -35,6 +35,15 @@ class Settings(BaseSettings):
     allowed_chat_id: int | None = None
     admin_user_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
 
+    payments_enabled: bool = False
+    tilda_webhook_secret: str = Field(default="", repr=False)
+    yookassa_shop_id: str = ""
+    yookassa_secret_key: str = Field(default="", repr=False)
+    # Filled only after an anonymized live audit; no assumed Tilda field names.
+    payments_contract: dict = Field(default_factory=dict)
+    payments_packages: dict = Field(default_factory=dict)
+    payments_timeout_seconds: float = Field(default=3, gt=0, le=10)
+
     database_url: str = ""
     database_password: str = ""
     database_ssl_root_cert: str = ""

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from functools import partial
 
 from aiogram import BaseMiddleware
@@ -19,6 +19,7 @@ from app.agents.main_expert import MainExpertAgent
 from app.agents.timeweb_client import TimewebClient
 from app.api.health import router as health_router
 from app.api.telegram_webhook import create_webhook_router
+from app.api.tilda_webhook import router as tilda_router
 from app.bot.factory import build_services, create_bot, create_dispatcher
 from app.bot.formatting.plan import EDITORIAL_VERSION
 from app.config import clear_settings_cache, get_settings
@@ -166,9 +167,18 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         )
         update_worker_task = asyncio.create_task(update_worker.run(), name="telegram-update-queue")
 
+    payment_task = None
+    if settings.database_url and settings.tilda_webhook_secret:
+        from app.services.payment_service import payment_worker
+
+        payment_task = asyncio.create_task(payment_worker(settings, bot), name="payments")
     try:
         yield
     finally:
+        if payment_task:
+            payment_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await payment_task
         if update_worker is not None and update_worker_task is not None:
             update_worker.stop()
             await update_worker_task
@@ -224,6 +234,7 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
     application.include_router(health_router)
+    application.include_router(tilda_router)
     application.include_router(create_webhook_router(settings))
     return application
 

@@ -288,3 +288,88 @@ async def admin_user(message: Message, settings) -> None:
         f"Баланс: {balance}\n"
         f"Резерв: {account.reserved}"
     )
+
+
+@router.message(
+    F.chat.type == "private", Command("admin_set_email", "admin_email", "admin_clear_email")
+)
+async def admin_email(message: Message, settings) -> None:
+    if not _is_admin(message, settings):
+        return
+    from app.services.payment_email import mask_email, set_email
+
+    parts = (message.text or "").split()
+    command = parts[0].split("@")[0]
+    try:
+        user_id = int(parts[1])
+        async with session_scope() as db:
+            if command == "/admin_email":
+                user = await Repository(db).get_user_by_telegram_id(user_id)
+                if not user:
+                    raise ValueError("user_not_found")
+            else:
+                if command == "/admin_clear_email" and parts[2:] != ["CONFIRM"]:
+                    raise ValueError("clear_requires_CONFIRM")
+                if command == "/admin_set_email" and len(parts) != 3:
+                    raise ValueError("email_required")
+                user = await set_email(
+                    db,
+                    user_id,
+                    parts[2] if command == "/admin_set_email" else None,
+                    message.from_user.id,
+                )
+            result = mask_email(user.email_normalized)
+        await message.answer(f"Email пользователя {user_id}: {result}", parse_mode=None)
+    except (ValueError, IndexError):
+        await message.answer(
+            "Не выполнено. Проверьте ID и email; адрес может быть занят. "
+            "Удаление: /admin_clear_email <ID> CONFIRM",
+            parse_mode=None,
+        )
+
+
+@router.message(F.chat.type == "private", Command("admin_payment_status", "admin_payment_retry"))
+async def admin_payment(message: Message, settings) -> None:
+    if not _is_admin(message, settings):
+        return
+    from app.db.models.entities import PurchaseOrder
+    from app.services.payment_service import retry_order
+
+    try:
+        parts = (message.text or "").split()
+        order_id = uuid.UUID(parts[1])
+        async with session_scope() as db:
+            if parts[0].split("@")[0] == "/admin_payment_retry":
+                order = await retry_order(db, order_id, settings)
+            else:
+                order = await db.get(PurchaseOrder, order_id)
+            if order is None:
+                raise ValueError()
+            result = f"{order.id}: {order.status}; {order.error_code or 'OK'}"
+        await message.answer(result, parse_mode=None)
+    except (ValueError, IndexError):
+        await message.answer("Заказ не найден или безопасная повторная обработка запрещена.")
+
+
+@router.message(F.chat.type == "private", Command("admin_payment_resolve"))
+async def admin_payment_resolve(message: Message, settings) -> None:
+    if not _is_admin(message, settings):
+        return
+    from app.services.payment_service import resolve_recipient
+
+    parts = (message.text or "").split()
+    try:
+        if len(parts) != 4 or parts[3] != "CONFIRM":
+            raise ValueError()
+        async with session_scope() as db:
+            order = await resolve_recipient(
+                db, uuid.UUID(parts[1]), int(parts[2]), message.from_user.id, settings
+            )
+            result = f"{order.id}: {order.status}"
+        await message.answer(result, parse_mode=None)
+    except ValueError:
+        await message.answer(
+            "Не выполнено. После сверки: "
+            "/admin_payment_resolve <order UUID> <Telegram ID> CONFIRM. "
+            "Зафиксированного получателя менять нельзя."
+        )

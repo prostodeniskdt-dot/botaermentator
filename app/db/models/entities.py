@@ -28,6 +28,10 @@ class TelegramUser(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     telegram_user_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    email: Mapped[str | None] = mapped_column(String(254), nullable=True)
+    email_normalized: Mapped[str | None] = mapped_column(String(254), unique=True, nullable=True)
+    email_registered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    email_registered_by: Mapped[int | None] = mapped_column(BigInteger)
     username: Mapped[str | None] = mapped_column(String(255), nullable=True)
     first_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     last_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
@@ -373,3 +377,48 @@ class AnswerExpansion(Base):
     status: Mapped[str] = mapped_column(String(24), default="offered")
     cost: Mapped[int] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class EmailReservation(Base):
+    """Permanent ownership: a retired address cannot silently move to another user."""
+
+    __tablename__ = "email_reservations"
+    email_normalized: Mapped[str] = mapped_column(String(254), primary_key=True)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger)
+
+
+class PurchaseOrder(Base):
+    __tablename__ = "purchase_orders"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    event_key: Mapped[str] = mapped_column(String(64), unique=True)
+    payment_id: Mapped[str | None] = mapped_column(String(64), unique=True)
+    order_id: Mapped[str | None] = mapped_column(String(128))
+    lead_id: Mapped[str | None] = mapped_column(String(128))
+    email_normalized: Mapped[str | None] = mapped_column(String(254))
+    recipient_id: Mapped[int | None] = mapped_column(BigInteger)
+    details: Mapped[dict] = mapped_column(JSONB, default=dict)
+    status: Mapped[str] = mapped_column(String(32), default="received")
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    provider_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    credited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    credit_transaction_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class PaymentNotice(Base):
+    __tablename__ = "payment_notices"
+    kind: Mapped[str] = mapped_column(String(64), default="credit")
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    order_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("purchase_orders.id"))
+    recipient_id: Mapped[int] = mapped_column(BigInteger)
+    text: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(24), default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    __table_args__ = (UniqueConstraint("order_id", "recipient_id", "kind"),)
