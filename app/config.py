@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     admin_user_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
 
     payments_enabled: bool = False
-    payments_profile: Literal["custom", "tilda_test_2026_11_17"] = "custom"
+    payments_profile: Literal["custom", "tilda_test_2026_11_17", "tilda_live_2026_11_18"] = "custom"
     tilda_webhook_secret: str = Field(default="", repr=False)
     yookassa_shop_id: str = ""
     yookassa_secret_key: str = Field(default="", repr=False)
@@ -127,17 +127,19 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def apply_payment_profile(self) -> Self:
-        if self.payments_profile == "tilda_test_2026_11_17":
+        if self.payments_profile != "custom":
             from copy import deepcopy
 
-            from app.services.payment_catalog import TILDA_AUDITED_CONTRACT, TILDA_TEST_PACKAGES
+            from app.services.payment_catalog import PAYMENT_CATALOGS, TILDA_AUDITED_CONTRACT
+
+            packages = PAYMENT_CATALOGS[self.payments_profile]
 
             if (self.payments_contract and self.payments_contract != TILDA_AUDITED_CONTRACT) or (
-                self.payments_packages and self.payments_packages != TILDA_TEST_PACKAGES
+                self.payments_packages and self.payments_packages != packages
             ):
                 raise ValueError("Named payment profile conflicts with custom contract or packages")
             object.__setattr__(self, "payments_contract", deepcopy(TILDA_AUDITED_CONTRACT))
-            object.__setattr__(self, "payments_packages", deepcopy(TILDA_TEST_PACKAGES))
+            object.__setattr__(self, "payments_packages", deepcopy(packages))
         return self
 
     @field_validator("admin_user_ids", mode="before")

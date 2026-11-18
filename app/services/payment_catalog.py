@@ -33,3 +33,38 @@ TILDA_TEST_PACKAGES = {
     }
     for (code, credits), price in zip(CREDITS_BY_EXTERNAL_ID.items(), (100, 200, 300), strict=True)
 }
+
+
+# Final package counts, prices and code mapping explicitly confirmed by the owner.
+TILDA_LIVE_PACKAGES = {
+    "PbhJaRz1P31ctv9EIgXm": {"credits": 1, "amount_kopecks": 5000},
+    "EnvzUoDtB8uyPYfXBt5p": {"credits": 5, "amount_kopecks": 25000},
+    "XCEUGyv0icslp5eph439": {"credits": 10, "amount_kopecks": 35000},
+}
+TILDA_LIVE_PACKAGES = {
+    code: {
+        **package,
+        "currency": "RUB",
+        "catalog_version": "tilda_live_2026_11_18",
+        "audit_reference": "owner-confirmed-final-packages:2026-11-18",
+    }
+    for code, package in TILDA_LIVE_PACKAGES.items()
+}
+
+# Snapshot versions resolve against their original catalog, never the active price profile.
+PAYMENT_CATALOGS = {
+    "tilda_test_2026_11_17": TILDA_TEST_PACKAGES,
+    "tilda_live_2026_11_18": TILDA_LIVE_PACKAGES,
+}
+
+
+def validate_catalog_package(code: str, package: dict) -> bool:
+    version = package.get("catalog_version")
+    if version is None:
+        # Legacy snapshots created before catalogs were versioned retain their credit mapping.
+        expected = CREDITS_BY_EXTERNAL_ID.get(code)
+        return expected is None or package.get("credits") == expected
+    expected = PAYMENT_CATALOGS.get(version, {}).get(code)
+    return expected is not None and all(
+        package.get(key) == expected.get(key) for key in ("credits", "amount_kopecks", "currency")
+    )

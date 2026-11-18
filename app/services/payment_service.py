@@ -19,7 +19,7 @@ from sqlalchemy.dialects.postgresql import insert
 from app.db.models.entities import CreditTransaction, PaymentNotice, PurchaseOrder, TelegramUser
 from app.db.repositories import Repository
 from app.db.session import session_scope
-from app.services.payment_catalog import CREDITS_BY_EXTERNAL_ID
+from app.services.payment_catalog import validate_catalog_package
 from app.services.payment_email import normalize_email
 from app.services.tilda_payload import normalize_tilda_payload
 
@@ -241,8 +241,7 @@ def verify_payment(order, provider, settings):
         or package.get("currency", "RUB") != "RUB"
     ):
         raise ValueError("invalid_package")
-    expected_credits = CREDITS_BY_EXTERNAL_ID.get(data["sku"])
-    if expected_credits is not None and package.get("credits") != expected_credits:
+    if not validate_catalog_package(data["sku"], package):
         raise ValueError("invalid_package")
     for field in ("line_price_kopecks", "line_amount_kopecks"):
         if field in data and data[field] != package["amount_kopecks"]:
