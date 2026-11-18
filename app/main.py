@@ -198,6 +198,7 @@ def _private_commands() -> list[BotCommand]:
         BotCommand(command="deep", description="Подробный режим"),
         BotCommand(command="level", description="Уровень объяснений"),
         BotCommand(command="balance", description="Баланс кредитов"),
+        BotCommand(command="topup", description="Пополнить кредиты"),
         BotCommand(command="profile", description="Сохранённые факты"),
         BotCommand(command="remember", description="Запомнить факт"),
         BotCommand(command="forget", description="Очистить рабочую память"),

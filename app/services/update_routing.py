@@ -12,6 +12,7 @@ SERVICE_COMMANDS = frozenset(
         "mode",
         "level",
         "balance",
+        "topup",
         "privacy",
         "remember",
         "profile",

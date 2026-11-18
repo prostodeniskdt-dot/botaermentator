@@ -112,6 +112,7 @@ class Settings(BaseSettings):
     recommendations_enabled: bool = True
     courses_url: str = "https://t.me/ferm2bot"
     shop_url: str = "https://t.me/AtlasMoldShopBot"
+    credits_store_url: str = "https://lightly-cheerful-calliope.tilda.ws/"
     durable_update_queue_enabled: bool = True
     update_queue_concurrency: int = Field(default=2, ge=1, le=8)
     delivery_queue_concurrency: int = Field(default=2, ge=1, le=8)

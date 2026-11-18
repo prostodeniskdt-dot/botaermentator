@@ -15,7 +15,9 @@ from app.bot.keyboards import (
     BUTTON_NEW,
     BUTTON_PROFILE,
     BUTTON_QUICK,
+    BUTTON_TOPUP,
     MENU_BUTTONS,
+    credits_store_keyboard,
     private_menu_keyboard,
 )
 from app.db.repositories import Repository
@@ -178,14 +180,30 @@ async def private_balance(message: Message, settings, bot, access_service) -> No
     if not user:
         return
     if has_unlimited_credits(settings, user.telegram_user_id, user):
-        await _answer(message, BALANCE_UNLIMITED)
+        await _answer(
+            message,
+            BALANCE_UNLIMITED,
+            reply_markup=credits_store_keyboard(settings.credits_store_url),
+        )
         return
     async with session_scope() as db:
         account = await Repository(db).get_or_create_credit_account(
             message.from_user.id  # type: ignore[union-attr]
         )
         text = balance_text(account.balance, account.reserved)
-    await _answer(message, text)
+    await _answer(message, text, reply_markup=credits_store_keyboard(settings.credits_store_url))
+
+
+@router.message(F.chat.type == "private", Command("topup"))
+async def private_topup(message: Message, settings, bot, access_service) -> None:
+    if not await _active_user(message, settings, bot, access_service):
+        return
+    await _answer(
+        message,
+        "Выберите пакет кредитов на сайте. При оплате укажите тот же email, "
+        "который администратор зарегистрировал для вас в боте.",
+        reply_markup=credits_store_keyboard(settings.credits_store_url),
+    )
 
 
 @router.message(F.chat.type == "private", Command("privacy"))
@@ -335,6 +353,7 @@ async def private_menu_button(message: Message, settings, bot, access_service) -
         BUTTON_DEEP: private_deep,
         BUTTON_NEW: private_new,
         BUTTON_BALANCE: private_balance,
+        BUTTON_TOPUP: private_topup,
         BUTTON_PROFILE: private_profile,
         BUTTON_HELP: private_help,
     }
