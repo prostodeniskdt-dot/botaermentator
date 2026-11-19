@@ -273,7 +273,7 @@ async def admin_grant_credits(message: Message, settings, update_id: int) -> Non
 
 @router.message(F.chat.type == "private", Command("admin_user"))
 async def admin_user(message: Message, settings) -> None:
-    if not _is_admin(message, settings):
+    if not _is_admin(message, settings) or message.chat.type != "private":
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) != 2:
@@ -287,6 +287,7 @@ async def admin_user(message: Message, settings) -> None:
     if user is None:
         await message.answer("Пользователь не найден.")
         return
+    from app.services.admin_payment_report import admin_email_report
     from app.services.credit_service import has_unlimited_credits
 
     balance = (
@@ -300,7 +301,8 @@ async def admin_user(message: Message, settings) -> None:
         f"Доступ: {user.access_status}\n"
         f"Режим: {user.response_mode}\n"
         f"Баланс: {balance}\n"
-        f"Резерв: {account.reserved}"
+        f"Резерв: {account.reserved}\n\n" + admin_email_report(user),
+        parse_mode=None,
     )
 
 
@@ -308,12 +310,28 @@ async def admin_user(message: Message, settings) -> None:
     F.chat.type == "private", Command("admin_set_email", "admin_email", "admin_clear_email")
 )
 async def admin_email(message: Message, settings) -> None:
-    if not _is_admin(message, settings):
+    if not _is_admin(message, settings) or message.chat.type != "private":
         return
-    from app.services.payment_email import mask_email, set_email
+    from app.services.admin_payment_report import admin_email_report
+    from app.services.payment_email import set_email
 
     parts = (message.text or "").split()
     command = parts[0].split("@")[0]
+    usage = (
+        "Формат команд (сначала Telegram ID):\n"
+        "/admin_email <ID>\n/admin_set_email <ID> <email>\n"
+        "/admin_clear_email <ID> CONFIRM"
+    )
+    try:
+        expected = 2 if command == "/admin_email" else 3
+        if len(parts) != expected:
+            raise ValueError()
+        int(parts[1])
+        if command == "/admin_clear_email" and parts[2] != "CONFIRM":
+            raise ValueError()
+    except (ValueError, IndexError):
+        await message.answer(usage, parse_mode=None)
+        return
     try:
         user_id = int(parts[1])
         async with session_scope() as db:
@@ -332,8 +350,8 @@ async def admin_email(message: Message, settings) -> None:
                     parts[2] if command == "/admin_set_email" else None,
                     message.from_user.id,
                 )
-            result = mask_email(user.email_normalized)
-        await message.answer(f"Email пользователя {user_id}: {result}", parse_mode=None)
+            result = admin_email_report(user)
+        await message.answer(result, parse_mode=None)
     except (ValueError, IndexError):
         await message.answer(
             "Не выполнено. Проверьте ID и email; адрес может быть занят. "
@@ -344,9 +362,10 @@ async def admin_email(message: Message, settings) -> None:
 
 @router.message(F.chat.type == "private", Command("admin_payment_status", "admin_payment_retry"))
 async def admin_payment(message: Message, settings) -> None:
-    if not _is_admin(message, settings):
+    if not _is_admin(message, settings) or message.chat.type != "private":
         return
     from app.db.models.entities import PurchaseOrder
+    from app.services.admin_payment_report import admin_order_report
     from app.services.payment_service import retry_order
 
     try:
@@ -359,7 +378,11 @@ async def admin_payment(message: Message, settings) -> None:
                 order = await db.get(PurchaseOrder, order_id)
             if order is None:
                 raise ValueError()
-            result = f"{order.id}: {order.status}; {order.error_code or 'OK'}"
+            result = (
+                admin_order_report(order)
+                if parts[0].split("@")[0] == "/admin_payment_status"
+                else f"{order.id}: {order.status}; {order.error_code or 'OK'}"
+            )
         await message.answer(result, parse_mode=None)
     except (ValueError, IndexError):
         await message.answer("Заказ не найден или безопасная повторная обработка запрещена.")
