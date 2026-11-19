@@ -33,7 +33,7 @@ async def test_approved_user_gets_store_link_and_email_reminder(monkeypatch):
     message.answer.assert_awaited_once()
     assert "email" in message.answer.call_args.args[0]
     button = message.answer.call_args.kwargs["reply_markup"].inline_keyboard[0][0]
-    assert button.url == "https://lightly-cheerful-calliope.tilda.ws/"
+    assert button.url == "https://podernik.ru/bot"
 
 
 async def test_access_denied_does_not_send_shop_link(monkeypatch):
