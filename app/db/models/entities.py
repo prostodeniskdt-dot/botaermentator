@@ -32,6 +32,12 @@ class TelegramUser(Base):
     email_normalized: Mapped[str | None] = mapped_column(String(254), unique=True, nullable=True)
     email_registered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     email_registered_by: Mapped[int | None] = mapped_column(BigInteger)
+    registration_email_required: Mapped[bool] = mapped_column(Boolean, default=True)
+    registration_email: Mapped[str | None] = mapped_column(String(254))
+    registration_email_confirmed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    registration_email_notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     username: Mapped[str | None] = mapped_column(String(255), nullable=True)
     first_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     last_name: Mapped[str | None] = mapped_column(String(255), nullable=True)

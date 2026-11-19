@@ -204,13 +204,21 @@ async def admin_allow(message: Message, settings, access_service, bot) -> None:
         await message.answer("Usage: /admin_allow <telegram_user_id>")
         return
     user_id = int(parts[1])
-    async with session_scope() as db:
-        user = await access_service.approve(
-            Repository(db),
-            bot,
-            user_id,
-            admin_telegram_user_id=message.from_user.id,  # type: ignore[union-attr]
+    try:
+        async with session_scope() as db:
+            user = await access_service.approve(
+                Repository(db),
+                bot,
+                user_id,
+                admin_telegram_user_id=message.from_user.id,  # type: ignore[union-attr]
+            )
+    except ValueError:
+        await message.answer(
+            "Сначала пользователь должен ввести и подтвердить email. "
+            "Зарегистрируйте этот адрес через /admin_set_email, затем повторите /admin_allow.",
+            parse_mode=None,
         )
+        return
     if user is None:
         await message.answer("Пользователь не найден. Сначала он должен запустить бота.")
         return

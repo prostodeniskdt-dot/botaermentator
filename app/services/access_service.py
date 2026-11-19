@@ -34,6 +34,7 @@ class AccessService:
         if (
             self.settings.notify_admin_on_access_request
             and user.access_status == AccessStatus.PENDING
+            and getattr(user, "registration_email_required", False) is not True
             and is_new_request
         ):
             await self._notify_admins(bot, user)
@@ -47,6 +48,18 @@ class AccessService:
         *,
         admin_telegram_user_id: int,
     ) -> object | None:
+        candidate = await repo.get_user_by_telegram_id(telegram_user_id, for_update=True)
+        if (
+            candidate is not None
+            and candidate.access_status == AccessStatus.PENDING
+            and getattr(candidate, "registration_email_required", False) is True
+            and (
+                not candidate.registration_email_confirmed_at
+                or not isinstance(candidate.email_normalized, str)
+                or candidate.email_normalized != candidate.registration_email
+            )
+        ):
+            raise ValueError("registration_email_not_registered")
         user = await repo.set_user_access(
             telegram_user_id,
             AccessStatus.ACTIVE,
@@ -83,7 +96,7 @@ class AccessService:
             admin_telegram_user_id=admin_telegram_user_id,
         )
 
-    async def _notify_admins(self, bot: Bot, user) -> None:
+    async def _notify_admins(self, bot: Bot, user) -> bool:
         username = f"@{escape(user.username)}" if user.username else "без username"
         name = (
             " ".join(
@@ -102,8 +115,27 @@ class AccessService:
             f"/admin_allow {user.telegram_user_id}\n"
             f"/admin_reject {user.telegram_user_id}"
         )
+        if (
+            getattr(user, "registration_email_required", False) is True
+            and user.registration_email_confirmed_at
+        ):
+            email = escape(user.registration_email)
+            text = (
+                "Заявка: пользователь проверил свой email\n"
+                f"Telegram ID: <code>{user.telegram_user_id}</code>\n"
+                f"Email: <code>{email}</code>\n\n"
+                "Пользователь проверил ввод; владение почтой письмом не проверялось.\n"
+                "Сначала зарегистрируйте адрес:\n"
+                f"<code>/admin_set_email {user.telegram_user_id} {email}</code>\n"
+                "Затем одобрите доступ:\n"
+                f"/admin_allow {user.telegram_user_id}\n"
+                f"/admin_reject {user.telegram_user_id}"
+            )
+        sent = False
         for admin_id in self.settings.admin_user_ids:
             try:
-                await bot.send_message(admin_id, text)
+                await bot.send_message(admin_id, text, parse_mode="HTML")
+                sent = True
             except TelegramAPIError:
                 continue
+        return sent

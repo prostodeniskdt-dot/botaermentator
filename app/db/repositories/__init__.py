@@ -83,8 +83,12 @@ class Repository:
         await self.session.flush()
         return user
 
-    async def get_user_by_telegram_id(self, telegram_user_id: int) -> TelegramUser | None:
+    async def get_user_by_telegram_id(
+        self, telegram_user_id: int, *, for_update: bool = False
+    ) -> TelegramUser | None:
         stmt = select(TelegramUser).where(TelegramUser.telegram_user_id == telegram_user_id)
+        if for_update:
+            stmt = stmt.with_for_update()
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none()
 

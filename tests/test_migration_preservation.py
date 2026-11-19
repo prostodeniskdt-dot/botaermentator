@@ -158,6 +158,14 @@ async def test_upgrade_preserves_existing_dialogue_profile_credits_and_queue():
         await migrate("upgrade", "head")
         assert await snapshot() == before
         async with engine.connect() as conn:
+            legacy = (
+                await conn.execute(
+                    text(
+                        "SELECT registration_email_required,registration_email FROM telegram_users"
+                    )
+                )
+            ).one()
+            assert tuple(legacy) == (False, None)
             assert (
                 await conn.execute(text("SELECT lane FROM telegram_update_jobs"))
             ).scalar_one() == "service"

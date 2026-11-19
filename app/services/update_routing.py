@@ -13,6 +13,15 @@ SERVICE_COMMANDS = frozenset(
         "level",
         "balance",
         "topup",
+        "email",
+        "admin_set_email",
+        "admin_email",
+        "admin_clear_email",
+        "admin_payment_status",
+        "admin_payment_retry",
+        "admin_payment_resolve",
+        "admin_payment_schema",
+        "admin_payment_audit",
         "privacy",
         "remember",
         "profile",
@@ -44,6 +53,9 @@ def update_lane(payload: dict) -> str:
     if command.startswith("/") and command[1:] in SERVICE_COMMANDS:
         return "service"
     callback = (payload.get("callback_query") or {}).get("data") or ""
-    if callback.startswith(("level:", "forget:", "feedback:")) or "my_chat_member" in payload:
+    if (
+        callback.startswith(("level:", "forget:", "feedback:", "regemail:"))
+        or "my_chat_member" in payload
+    ):
         return "service"
     return "question"

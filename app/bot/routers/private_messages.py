@@ -61,6 +61,11 @@ async def _active_user(message: Message, settings, bot, access_service):
         if user is None:
             user = await access_service.register_request(repo, message, bot)
         if user.access_status != AccessStatus.ACTIVE:
+            from app.services.registration_email import needs_registration
+
+            if needs_registration(user):
+                await _registration_reply(message, user, db, bot, access_service, accept_text=True)
+                return None
             await message.answer(_access_message(user.access_status, settings))
             return None
         return user
@@ -76,6 +81,11 @@ async def private_start(message: Message, settings, bot, access_service) -> None
     async with session_scope() as db:
         repo = Repository(db)
         user = await access_service.register_request(repo, message, bot)
+        from app.services.registration_email import needs_registration
+
+        if needs_registration(user):
+            await _registration_reply(message, user, db, bot, access_service)
+            return
     if user.access_status == AccessStatus.ACTIVE:
         await _answer(message, WELCOME)
     else:
@@ -358,6 +368,61 @@ async def private_menu_button(message: Message, settings, bot, access_service) -
         BUTTON_HELP: private_help,
     }
     await actions[message.text or ""](message, settings, bot, access_service)
+
+
+async def _registration_reply(message, user, db, bot, access_service, *, accept_text=False):
+    from app.services.registration_email import notify_technician, prompt, submit_email
+
+    text = (message.text or "").strip()
+    if accept_text and text not in MENU_BUTTONS:
+        is_email_command = text.split(maxsplit=1)[0].split("@")[0] == "/email" if text else False
+        if is_email_command:
+            text = text.split(maxsplit=1)[1] if len(text.split(maxsplit=1)) == 2 else ""
+        if is_email_command or (text and not text.startswith("/")):
+            try:
+                user = await submit_email(db, message.from_user.id, text)
+            except ValueError:
+                await message.answer(
+                    "Не удалось принять email. Проверьте написание адреса и отправьте его снова. "
+                    "Если адрес уже использовался в боте, обратитесь к технику.",
+                    parse_mode=None,
+                )
+                return
+    await notify_technician(db, message.from_user.id, bot, access_service)
+    text, keyboard = prompt(user)
+    await message.answer(text, reply_markup=keyboard, parse_mode=None)
+
+
+@router.message(F.chat.type == "private", Command("email"))
+async def private_registration_email(message: Message, settings, bot, access_service) -> None:
+    user = await _active_user(message, settings, bot, access_service)
+    if user is not None:
+        await message.answer(
+            "Изменение зарегистрированного email выполняет техник. Обратитесь к администратору.",
+            parse_mode=None,
+        )
+
+
+@router.callback_query(F.data.startswith("regemail:"))
+async def registration_email_callback(callback: CallbackQuery, settings, bot, access_service):
+    from app.services.registration_email import confirm_email, notify_technician, prompt
+
+    if not isinstance(callback.message, Message) or callback.message.chat.type != "private":
+        await callback.answer()
+        return
+    try:
+        _, action, token = (callback.data or "").split(":")
+        if action not in {"confirm", "edit"}:
+            raise ValueError()
+        async with session_scope() as db:
+            user = await confirm_email(db, callback.from_user.id, token, edit=action == "edit")
+            await notify_technician(db, callback.from_user.id, bot, access_service)
+            text, keyboard = prompt(user)
+    except ValueError:
+        await callback.answer("Эта кнопка устарела. Отправьте /start.", show_alert=True)
+        return
+    await callback.answer()
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode=None)
 
 
 @router.message(F.chat.type == "private", F.text, ~F.text.startswith("/"))
