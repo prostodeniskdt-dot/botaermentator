@@ -105,7 +105,15 @@ async def test_private_answer_keeps_bottom_menu(settings: Settings) -> None:
     await service._send_answer_parts(bot, message, "Ответ")
     markup = bot.send_rich_message.await_args.kwargs["reply_markup"]
     labels = [button.text for row in markup.keyboard for button in row]
-    assert labels == ["Кратко", "Подробно", "Новая тема", "Баланс", "Профиль", "Помощь"]
+    assert labels == [
+        "Кратко",
+        "Подробно",
+        "Новая тема",
+        "Баланс",
+        "Профиль",
+        "Помощь",
+        "Пополнить кредиты",
+    ]
 
 
 @pytest.mark.asyncio

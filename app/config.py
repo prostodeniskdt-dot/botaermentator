@@ -36,7 +36,9 @@ class Settings(BaseSettings):
     admin_user_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
 
     payments_enabled: bool = False
-    payments_profile: Literal["custom", "tilda_test_2026_11_17", "tilda_live_2026_11_18"] = "custom"
+    payments_profile: Literal[
+        "custom", "tilda_test_2026_11_17", "tilda_live_2026_11_18", "tilda_live_2026_11_19"
+    ] = "custom"
     tilda_webhook_secret: str = Field(default="", repr=False)
     yookassa_shop_id: str = ""
     yookassa_secret_key: str = Field(default="", repr=False)

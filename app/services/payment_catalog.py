@@ -51,10 +51,27 @@ TILDA_LIVE_PACKAGES = {
     for code, package in TILDA_LIVE_PACKAGES.items()
 }
 
+# Revised owner-confirmed catalog on podernik.ru/bot, 19 November 2026.
+TILDA_LIVE_2026_11_19_PACKAGES = {
+    "PbhJaRz1P31ctv9EIgXm": {"credits": 3, "amount_kopecks": 18000},
+    "EnvzUoDtB8uyPYfXBt5p": {"credits": 10, "amount_kopecks": 50000},
+    "XCEUGyv0icslp5eph439": {"credits": 50, "amount_kopecks": 200000},
+}
+TILDA_LIVE_2026_11_19_PACKAGES = {
+    code: {
+        **package,
+        "currency": "RUB",
+        "catalog_version": "tilda_live_2026_11_19",
+        "audit_reference": "owner-confirmed-podernik-catalog:2026-11-19",
+    }
+    for code, package in TILDA_LIVE_2026_11_19_PACKAGES.items()
+}
+
 # Snapshot versions resolve against their original catalog, never the active price profile.
 PAYMENT_CATALOGS = {
     "tilda_test_2026_11_17": TILDA_TEST_PACKAGES,
     "tilda_live_2026_11_18": TILDA_LIVE_PACKAGES,
+    "tilda_live_2026_11_19": TILDA_LIVE_2026_11_19_PACKAGES,
 }
 
 
